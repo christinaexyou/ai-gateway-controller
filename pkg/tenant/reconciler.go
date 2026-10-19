@@ -33,11 +33,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/constants"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
@@ -123,6 +125,9 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
+		Watches(&aigatewayv1alpha1.AIGuardrail{},
+			handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
+			builder.WithPredicates(NemoCalloutChanged())).
 		Complete(r)
 }
 
@@ -440,6 +445,13 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		}
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
+	}
+	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace, log)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := configureNemoCallouts(resources, tenantID, gatewayNamespace, callouts); err != nil {
+		return ctrl.Result{}, fmt.Errorf("compile NeMo callouts: %w", err)
 	}
 	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
 		log.Info("praxis-extproc resources are still owned by another controller; waiting for handoff", "error", err)

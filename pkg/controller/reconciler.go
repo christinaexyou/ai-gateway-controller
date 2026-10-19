@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/publisher"
@@ -112,6 +113,11 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// again. Service events are namespace-scoped and therefore only fan out
 		// to models in the affected tenant.
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
+		// When a guardrail is added, removed or accepted, re-check the
+		// tenant's model routes: they run the guardrail filter only while
+		// the tenant has at least one active guardrail check.
+		Watches(&aigatewayv1alpha1.AIGuardrail{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels),
+			builder.WithPredicates(inScope, tenant.NemoCalloutChanged())).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
 		// Gateway attachments: route acceptance is reported in HTTPRoute
@@ -1871,6 +1877,10 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			},
 		},
 	}}
+	checks, err := tenant.HasNemoCallouts(ctx, r.Client, modelNamespace)
+	if err != nil {
+		return err
+	}
 	kept := append(make([]any, 0, len(preserved)+len(routes)*3+len(attached)*3+2), preserved...)
 
 	byModel := map[string][]resolver.Route{}
@@ -1919,6 +1929,61 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			requestMode = "BUFFERED"
 		}
 		for index := 0; index < route.count; index++ {
+			perFilter := map[string]any{
+				externalModelPreExtProcFilter: map[string]any{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"overrides": map[string]any{
+						"processing_mode": map[string]any{
+							"request_header_mode": "SEND",
+							// The pre-auth processor extracts the model from JSON before
+							// authentication. Give its body-field-to-header filter the
+							// complete request body; only post-auth Praxis needs streamed
+							// chunks for selected-provider translation.
+							"request_body_mode":     "BUFFERED",
+							"response_header_mode":  "SKIP",
+							"response_body_mode":    "NONE",
+							"request_trailer_mode":  "SKIP",
+							"response_trailer_mode": "SKIP",
+						},
+					},
+				},
+				externalModelExtProcFilter: map[string]any{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					// ExtProcPerRoute is disable-only when the
+					// vhost config is disabled. An overrides
+					// object is the supported way for this
+					// more-specific ExternalModel route to
+					// re-enable the filter.
+					"overrides": map[string]any{
+						"processing_mode": map[string]any{
+							"request_header_mode": "SEND",
+							// Buffer translated requests so Envoy sends one complete body message,
+							// including when trailers follow. Flag-off keeps its existing mode.
+							"request_body_mode":    requestMode,
+							"response_header_mode": "SEND",
+							// Envoy chooses the response processing mode before the
+							// provider is selected. Stream all rules for a model that
+							// can select Messages; retain NONE for OpenAI-only models.
+							"response_body_mode":    responseMode,
+							"request_trailer_mode":  "SKIP",
+							"response_trailer_mode": "SKIP",
+						},
+					},
+				},
+				"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
+					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"disabled": true,
+				},
+			}
+			// The "ipp" filter is where the tenant's guardrail checks run.
+			// Leave it on when the tenant has checks so requests to this
+			// model are screened; otherwise turn it off as before.
+			if !checks {
+				perFilter["envoy.filters.http.ext_proc.ipp"] = map[string]any{
+					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
+					"disabled": true,
+				}
+			}
 			kept = append(kept, map[string]any{
 				"applyTo": "HTTP_ROUTE",
 				"match": map[string]any{
@@ -1931,56 +1996,7 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 				},
 				"patch": map[string]any{
 					"operation": "MERGE",
-					"value": map[string]any{"typed_per_filter_config": map[string]any{
-						externalModelPreExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// The pre-auth processor extracts the model from JSON before
-									// authentication. Give its body-field-to-header filter the
-									// complete request body; only post-auth Praxis needs streamed
-									// chunks for selected-provider translation.
-									"request_body_mode":     "BUFFERED",
-									"response_header_mode":  "SKIP",
-									"response_body_mode":    "NONE",
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
-							},
-						},
-						externalModelExtProcFilter: map[string]any{
-							"@type": "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							// ExtProcPerRoute is disable-only when the
-							// vhost config is disabled. An overrides
-							// object is the supported way for this
-							// more-specific ExternalModel route to
-							// re-enable the filter.
-							"overrides": map[string]any{
-								"processing_mode": map[string]any{
-									"request_header_mode": "SEND",
-									// Buffer translated requests so Envoy sends one complete body message,
-									// including when trailers follow. Flag-off keeps its existing mode.
-									"request_body_mode":    requestMode,
-									"response_header_mode": "SEND",
-									// Envoy chooses the response processing mode before the
-									// provider is selected. Stream all rules for a model that
-									// can select Messages; retain NONE for OpenAI-only models.
-									"response_body_mode":    responseMode,
-									"request_trailer_mode":  "SKIP",
-									"response_trailer_mode": "SKIP",
-								},
-							},
-						},
-						"envoy.filters.http.ext_proc.ipp-pre": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-						"envoy.filters.http.ext_proc.ipp": map[string]any{
-							"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
-							"disabled": true,
-						},
-					}},
+					"value":     map[string]any{"typed_per_filter_config": perFilter},
 				},
 			})
 		}

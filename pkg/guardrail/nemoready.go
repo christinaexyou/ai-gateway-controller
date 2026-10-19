@@ -21,6 +21,7 @@ import (
 	"net/url"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // nemoReadiness is what reading a NemoGuardrails provider's status answers:
@@ -72,14 +73,9 @@ type nemoReadiness struct {
 // RouteDisabled when not exposed — which a naive True check would read as
 // failure.
 //
-// An absent endpoint is reported uniformly, whatever the cause. The common one
-// is authentication being switched off: upstream writes the field only when
-// utils.RequiresAuth holds, so security.opendatahub.io/enable-auth: "false"
-// clears it. Re-reading that annotation here to word a more specific message
-// would put a second interpretation of an upstream predicate in this package,
-// and the proposal asks for authenticated internal connectivity regardless
-// (:1338) — an unauthenticated server is not one a binding should activate
-// against.
+// When status.endpoint is not published, the server is reached through its
+// plain http Service on port 80 in status.workloadNamespace, which upstream
+// publishes once the workload is ready.
 //
 // The value is parsed rather than trusted. status.endpoint is owned by another
 // controller, and anything that is not a plain absolute https base URL — no
@@ -99,6 +95,15 @@ func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
 
 	discovered, found, err := unstructured.NestedString(nemo.Object, "status", "endpoint")
 	if err != nil || !found || discovered == "" {
+		if endpoint, ok := nemoServiceEndpoint(nemo); ok {
+			return nemoReadiness{
+				Ready:    true,
+				Endpoint: endpoint,
+				Reason:   reasonProviderAvailable,
+				Message: "referenced NemoGuardrails provider is reachable through its in-cluster http Service; " +
+					"this confirms discovery, not that the server is serving",
+			}
+		}
 		return undiscovered
 	}
 
@@ -128,4 +133,17 @@ func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
 		Message: "referenced NemoGuardrails provider publishes an authenticated in-cluster checks endpoint; " +
 			"this confirms discovery, not that the server is serving",
 	}
+}
+
+// nemoServiceEndpoint returns the server's in-cluster http Service URL once
+// status.workloadNamespace is published.
+func nemoServiceEndpoint(nemo *unstructured.Unstructured) (string, bool) {
+	namespace, _, err := unstructured.NestedString(nemo.Object, "status", "workloadNamespace")
+	if err != nil || namespace == "" || nemo.GetName() == "" {
+		return "", false
+	}
+	if errs := validation.IsDNS1123Label(namespace); len(errs) > 0 {
+		return "", false
+	}
+	return "http://" + nemo.GetName() + "." + namespace + ".svc.cluster.local", true
 }
