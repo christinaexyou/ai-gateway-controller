@@ -450,7 +450,8 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := configureNemoCallouts(resources, tenantID, gatewayNamespace, callouts); err != nil {
+	resources, err = configureNemoCallouts(resources, tenantID, gatewayNamespace, callouts)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("compile NeMo callouts: %w", err)
 	}
 	if err := r.waitForForeignOwnership(ctx, resources); err != nil {
@@ -485,6 +486,9 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, fmt.Errorf("apply: %w", err)
 	}
 	if err := r.cleanupOrphanedIPPHPAs(ctx, tenantID, gatewayNamespace, scaling); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.pruneNemoCallerRBAC(ctx, gatewayNamespace, postAuthServiceAccount(resources, tenantID, gatewayNamespace), resources); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1078,6 +1082,9 @@ func (r *Reconciler) cleanup(ctx context.Context, tenantID, gatewayNamespace, te
 		if err := r.deleteResourceIfOwned(ctx, t.gvk, t.name, t.namespace); err != nil {
 			return err
 		}
+	}
+	if err := r.pruneNemoCallerRBAC(ctx, gatewayNamespace, PayloadProcessingServiceAccountName(tenantID), nil); err != nil {
+		return err
 	}
 	return r.cleanupAttachmentState(ctx, tenantNamespace)
 }

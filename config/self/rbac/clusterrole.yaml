@@ -55,6 +55,12 @@ rules:
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["clusterroles", "clusterrolebindings"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# A Role and RoleBinding in each authenticated NemoGuardrails namespace let
+# the tenant post-auth ServiceAccount get the NeMo Service, which is what
+# kube-rbac-proxy checks. NeMo namespaces are not known ahead of time.
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["roles", "rolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 # Escalation-check mirror: ai-gateway-controller must hold every permission it
 # grants via payload-processing-reader.
 - apiGroups: [""]

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -44,9 +45,13 @@ const (
 	// callouts change. Praxis reads extproc.yaml only at start.
 	nemoCalloutConfigAnnotation = "aigateway.opendatahub.io/nemo-callouts-sha256"
 
-	// nemoServerPort is the NeMo server's pod port. Its Service maps port 80
-	// to it; OpenShift matches NetworkPolicy egress against the pod port.
+	// nemoServerPort is the NeMo server's pod port. With auth off its Service
+	// maps port 80 to it; OpenShift matches NetworkPolicy egress against the
+	// pod port.
 	nemoServerPort int64 = 8000
+	// nemoProxyPort is kube-rbac-proxy's pod port. With auth on the Service
+	// maps port 443 to it.
+	nemoProxyPort int64 = 8443
 
 	// nemoCheckModel is the fixed model Praxis sends on POST /v1/checks.
 	// NeMo owns the task model inside the selected configuration.
@@ -59,10 +64,15 @@ const (
 type nemoCallout struct {
 	name     string
 	endpoint string
+	// provider is the NemoGuardrails name, which is also its Service name.
+	provider string
 	// serviceNamespace is where the NeMo Service runs; egress is opened to it.
 	serviceNamespace string
-	timeout          time.Duration
-	checks           []nemoCheck
+	// authenticated means the Service is behind kube-rbac-proxy: the call
+	// carries the pod's ServiceAccount token and trusts the service CA.
+	authenticated bool
+	timeout       time.Duration
+	checks        []nemoCheck
 }
 
 // nemoCheck is one AIGuardrail check. Request and response are the Input
@@ -79,12 +89,13 @@ type nemoCheck struct {
 // nemoFilter is one compiled ai_guardrails entry. Exactly one of request
 // or response is set.
 type nemoFilter struct {
-	endpoint string
-	configID string
-	header   string
-	timeout  time.Duration
-	request  bool
-	response bool
+	endpoint      string
+	configID      string
+	header        string
+	authenticated bool
+	timeout       time.Duration
+	request       bool
+	response      bool
 }
 
 // acceptedNemoCallouts returns the tenant's current accepted NeMo callouts.
@@ -154,14 +165,17 @@ func NemoCalloutChanged() predicate.Funcs {
 }
 
 func nemoCalloutFrom(policy *aigatewayv1alpha1.AIGuardrail) (nemoCallout, error) {
-	namespace, err := nemoServiceNamespace(policy.Status.ProviderEndpoint, policy.Spec.Provider.Nemo.Ref.Name)
+	provider := policy.Spec.Provider.Nemo.Ref.Name
+	namespace, authenticated, err := nemoService(policy.Status.ProviderEndpoint, provider)
 	if err != nil {
 		return nemoCallout{}, err
 	}
 	callout := nemoCallout{
 		name:             policy.Name,
 		endpoint:         policy.Status.ProviderEndpoint,
+		provider:         provider,
 		serviceNamespace: namespace,
+		authenticated:    authenticated,
 		timeout:          policy.Spec.Provider.Timeout.Duration,
 	}
 	for _, check := range policy.Spec.Checks {
@@ -193,32 +207,42 @@ func nemoCalloutFrom(policy *aigatewayv1alpha1.AIGuardrail) (nemoCallout, error)
 	return callout, nil
 }
 
-// nemoServiceNamespace returns the namespace of the referenced provider's
-// http Service that endpoint addresses. Anything else is refused: the egress
-// rule opened for the callout is scoped to that namespace.
-func nemoServiceNamespace(endpoint, provider string) (string, error) {
+// nemoService returns the namespace of the referenced provider's Service that
+// endpoint addresses, and whether that Service is the authenticated one.
+// http on port 80 is the auth-off Service; https on port 443 is
+// kube-rbac-proxy. Anything else is refused: the pod's token is sent to this
+// host, and the egress rule and RBAC grant are scoped to its namespace.
+func nemoService(endpoint, provider string) (string, bool, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-		return "", fmt.Errorf("provider endpoint %q is not a plain base URL", endpoint)
+		return "", false, fmt.Errorf("provider endpoint %q is not a plain base URL", endpoint)
 	}
-	if parsed.Scheme != "http" {
-		return "", fmt.Errorf("provider endpoint %q must be http", endpoint)
-	}
-	if port := parsed.Port(); port != "" && port != "80" {
-		return "", fmt.Errorf("provider endpoint %q must use the Service's port 80", endpoint)
+	var authenticated bool
+	switch parsed.Scheme {
+	case "http":
+		if port := parsed.Port(); port != "" && port != "80" {
+			return "", false, fmt.Errorf("provider endpoint %q must use the Service's port 80", endpoint)
+		}
+	case "https":
+		if port := parsed.Port(); port != "" && port != "443" {
+			return "", false, fmt.Errorf("provider endpoint %q must use the Service's port 443", endpoint)
+		}
+		authenticated = true
+	default:
+		return "", false, fmt.Errorf("provider endpoint %q must be http or https", endpoint)
 	}
 	switch strings.TrimSuffix(parsed.Path, "/") {
 	case "", nemoChecksPath:
 	default:
-		return "", fmt.Errorf("provider endpoint %q must be the NeMo base URL", endpoint)
+		return "", false, fmt.Errorf("provider endpoint %q must be the NeMo base URL", endpoint)
 	}
 	host := strings.TrimSuffix(parsed.Hostname(), ".cluster.local")
 	name, rest, _ := strings.Cut(host, ".")
 	namespace, svc, _ := strings.Cut(rest, ".")
 	if name != provider || svc != "svc" || len(validation.IsDNS1123Label(namespace)) > 0 {
-		return "", fmt.Errorf("provider endpoint %q is not the in-cluster Service of NemoGuardrails %q", endpoint, provider)
+		return "", false, fmt.Errorf("provider endpoint %q is not the in-cluster Service of NemoGuardrails %q", endpoint, provider)
 	}
-	return namespace, nil
+	return namespace, authenticated, nil
 }
 
 // checksEndpoint is the NeMo checks URL Praxis posts to. status.providerEndpoint
@@ -234,45 +258,54 @@ func checksEndpoint(endpoint string) (string, error) {
 }
 
 // configureNemoCallouts compiles the callouts into the post-auth extproc.yaml
-// and opens egress to each NeMo namespace. With no callouts the rendered
-// resources are left as they are.
-func configureNemoCallouts(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, callouts []nemoCallout) error {
+// and opens egress to each NeMo namespace. For an authenticated provider it
+// also mounts the caller token and service CA on the post-auth pod and
+// appends the Role and RoleBinding that let that pod call the provider. With
+// no callouts the rendered resources are returned as they are.
+func configureNemoCallouts(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, callouts []nemoCallout) ([]unstructured.Unstructured, error) {
 	if len(callouts) == 0 {
-		return nil
+		return resources, nil
 	}
 	deploymentName := PayloadProcessingDeploymentName(tenantID)
 	deployment := findResource(resources, "Deployment", deploymentName, gatewayNamespace)
 	if deployment == nil {
-		return fmt.Errorf("payload-processing Deployment %s is missing", deploymentName)
+		return nil, fmt.Errorf("payload-processing Deployment %s is missing", deploymentName)
 	}
 	configMapName := PayloadProcessingPluginsConfigMapForTenant(tenantID)
 	configMap := findResource(resources, "ConfigMap", configMapName, gatewayNamespace)
 	if configMap == nil {
-		return fmt.Errorf("payload-processing ConfigMap %s is missing", configMapName)
+		return nil, fmt.Errorf("payload-processing ConfigMap %s is missing", configMapName)
 	}
 	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
 	if err != nil || !found {
 		if err == nil {
 			err = errors.New("data is missing")
 		}
-		return fmt.Errorf("read payload-processing ConfigMap: %w", err)
+		return nil, fmt.Errorf("read payload-processing ConfigMap: %w", err)
 	}
 	compiled, err := compileNemoExtproc(data["extproc.yaml"], callouts)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data["extproc.yaml"] = compiled
 	if err := unstructured.SetNestedStringMap(configMap.Object, data, "data"); err != nil {
-		return fmt.Errorf("write payload-processing ConfigMap: %w", err)
+		return nil, fmt.Errorf("write payload-processing ConfigMap: %w", err)
 	}
 	if err := ensureNemoEgress(resources, tenantID, gatewayNamespace, callouts); err != nil {
-		return err
+		return nil, err
 	}
 	sum := sha256.Sum256([]byte(compiled))
 	if err := unstructured.SetNestedField(deployment.Object, hex.EncodeToString(sum[:]), "spec", "template", "metadata", "annotations", nemoCalloutConfigAnnotation); err != nil {
-		return fmt.Errorf("write NeMo callout config hash: %w", err)
+		return nil, fmt.Errorf("write NeMo callout config hash: %w", err)
 	}
-	return nil
+	if !slices.ContainsFunc(callouts, func(c nemoCallout) bool { return c.authenticated }) {
+		return resources, nil
+	}
+	if err := mountNemoAuth(deployment); err != nil {
+		return nil, err
+	}
+	serviceAccount := postAuthServiceAccount(resources, tenantID, gatewayNamespace)
+	return append(resources, nemoCallerRBAC(callouts, gatewayNamespace, serviceAccount)...), nil
 }
 
 // compileNemoExtproc inserts the checks right after the post-auth chain's
@@ -345,13 +378,19 @@ func insertAfterRequestID(doc map[string]any, entries []any) bool {
 }
 
 // nemoFilterEntry runs one check when its selection header is "true". A
-// request that skips the check also skips its response hook.
+// request that skips the check also skips its response hook. Praxis refuses
+// token_file and tls on a plaintext endpoint, so only an authenticated
+// provider gets them.
 func nemoFilterEntry(filter nemoFilter) map[string]any {
 	provider := map[string]any{
 		"type":       "nemo",
 		"endpoint":   filter.endpoint,
 		"model":      nemoCheckModel,
 		"guardrails": map[string]any{"config_ids": []any{filter.configID}},
+	}
+	if filter.authenticated {
+		provider["token_file"] = nemoTokenFile
+		provider["tls"] = map[string]any{"ca_file": nemoServiceCAFile}
 	}
 	if filter.timeout > 0 {
 		provider["timeout_ms"] = filter.timeout.Milliseconds()
@@ -378,7 +417,7 @@ func expandNemoChecks(callouts []nemoCallout) ([]nemoFilter, error) {
 			return nil, fmt.Errorf("AIGuardrail %s: %w", callout.name, err)
 		}
 		for _, check := range callout.checks {
-			filter := nemoFilter{endpoint: endpoint, configID: check.configID, header: check.header, timeout: callout.timeout}
+			filter := nemoFilter{endpoint: endpoint, configID: check.configID, header: check.header, authenticated: callout.authenticated, timeout: callout.timeout}
 			if check.request {
 				input := filter
 				input.request = true
@@ -399,10 +438,11 @@ func expandNemoChecks(callouts []nemoCallout) ([]nemoFilter, error) {
 	return forward, nil
 }
 
-// ensureNemoEgress opens TCP 8000 from the post-auth pod to each NeMo
-// namespace. The vendored NetworkPolicy allows the API server ports only. A
-// missing policy is left alone: SkipNetworkPolicy removes it before this
-// runs.
+// ensureNemoEgress opens the NeMo pod port from the post-auth pod to each
+// NeMo namespace: TCP 8000 for an auth-off server and TCP 8443 for
+// kube-rbac-proxy. The vendored NetworkPolicy allows the API server ports
+// only. A missing policy is left alone: SkipNetworkPolicy removes it before
+// this runs.
 func ensureNemoEgress(resources []unstructured.Unstructured, tenantID, gatewayNamespace string, callouts []nemoCallout) error {
 	policy := findResource(resources, "NetworkPolicy", PayloadProcessingNetworkPolicyName(tenantID), gatewayNamespace)
 	if policy == nil {
@@ -412,27 +452,40 @@ func ensureNemoEgress(resources []unstructured.Unstructured, tenantID, gatewayNa
 	if err != nil {
 		return fmt.Errorf("read payload-processing NetworkPolicy egress: %w", err)
 	}
-	namespaces := map[string]struct{}{}
+	byPort := map[int64]map[string]struct{}{}
 	for _, callout := range callouts {
-		namespaces[callout.serviceNamespace] = struct{}{}
+		port := nemoServerPort
+		if callout.authenticated {
+			port = nemoProxyPort
+		}
+		if byPort[port] == nil {
+			byPort[port] = map[string]struct{}{}
+		}
+		byPort[port][callout.serviceNamespace] = struct{}{}
 	}
-	sorted := make([]string, 0, len(namespaces))
-	for namespace := range namespaces {
-		sorted = append(sorted, namespace)
-	}
-	sort.Strings(sorted)
-	peers := make([]any, 0, len(sorted))
-	for _, namespace := range sorted {
-		peers = append(peers, map[string]any{
-			"namespaceSelector": map[string]any{
-				"matchLabels": map[string]any{"kubernetes.io/metadata.name": namespace},
-			},
+	for _, port := range []int64{nemoServerPort, nemoProxyPort} {
+		namespaces := byPort[port]
+		if len(namespaces) == 0 {
+			continue
+		}
+		sorted := make([]string, 0, len(namespaces))
+		for namespace := range namespaces {
+			sorted = append(sorted, namespace)
+		}
+		sort.Strings(sorted)
+		peers := make([]any, 0, len(sorted))
+		for _, namespace := range sorted {
+			peers = append(peers, map[string]any{
+				"namespaceSelector": map[string]any{
+					"matchLabels": map[string]any{"kubernetes.io/metadata.name": namespace},
+				},
+			})
+		}
+		egress = append(egress, map[string]any{
+			"to":    peers,
+			"ports": []any{map[string]any{"protocol": "TCP", "port": port}},
 		})
 	}
-	egress = append(egress, map[string]any{
-		"to":    peers,
-		"ports": []any{map[string]any{"protocol": "TCP", "port": nemoServerPort}},
-	})
 	if err := unstructured.SetNestedSlice(policy.Object, egress, "spec", "egress"); err != nil {
 		return fmt.Errorf("write payload-processing NetworkPolicy egress: %w", err)
 	}
