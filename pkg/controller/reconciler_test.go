@@ -1023,6 +1023,49 @@ func TestMaasTenantConfigEventsFanOutOnlyWithinConfigNamespace(t *testing.T) {
 	}
 }
 
+func TestAIGuardrailEventsEnqueueTenantAndGatewayAttachedModels(t *testing.T) {
+	tenantGateway := v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: "gateway-system"}
+	tenantModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{GatewayRefs: []v1alpha1.NamespacedObjectReference{tenantGateway}}}
+	attachedModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "attached", Namespace: "team-a"}, Spec: v1alpha1.ExternalModelSpec{GatewayRefs: []v1alpha1.NamespacedObjectReference{tenantGateway}}}
+	unrelatedModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "team-b"}, Spec: v1alpha1.ExternalModelSpec{GatewayRefs: []v1alpha1.NamespacedObjectReference{gatewayB}}}
+	guardrail := &aigatewayv1alpha1.AIGuardrail{ObjectMeta: metav1.ObjectMeta{Name: "safety", Namespace: "tenant-a"}}
+	ait := controllerAITenant("tenant-a", "models-as-a-service", "tenant-a", tenantGateway.Name, tenantGateway.Namespace)
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant-a", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, tenantModel, attachedModel, unrelatedModel, guardrail, ait, mtc)
+
+	want := map[types.NamespacedName]bool{
+		client.ObjectKeyFromObject(tenantModel):   true,
+		client.ObjectKeyFromObject(attachedModel): true,
+	}
+	got := r.aiguardrailModels(context.Background(), guardrail)
+	if len(got) != len(want) {
+		t.Fatalf("AIGuardrail event enqueued %#v, want %#v", got, want)
+	}
+	for _, request := range got {
+		if !want[request.NamespacedName] {
+			t.Fatalf("AIGuardrail event unexpectedly enqueued %s", request.NamespacedName)
+		}
+		delete(want, request.NamespacedName)
+	}
+	if len(want) != 0 {
+		t.Fatalf("AIGuardrail event missed %#v", want)
+	}
+}
+
+func TestDefaultTenantAIGuardrailEventsEnqueueImplicitModels(t *testing.T) {
+	implicitModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "implicit", Namespace: "team-a"}}
+	guardrail := &aigatewayv1alpha1.AIGuardrail{ObjectMeta: metav1.ObjectMeta{Name: "safety", Namespace: "models-as-a-service"}}
+	defaultTenant := controllerAITenant(tenant.DefaultAITenantName, "models-as-a-service", "models-as-a-service", defaultGateway.Name, defaultGateway.Namespace)
+	mtc := controllerMaasTenantConfig("models-as-a-service", tenant.DefaultAITenantName, "models-as-a-service", "praxis")
+	r := controllerTestClient(t, implicitModel, guardrail, defaultTenant, mtc)
+
+	got := r.aiguardrailModels(context.Background(), guardrail)
+	want := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(implicitModel)}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("default tenant AIGuardrail event enqueued %#v, want %#v", got, want)
+	}
+}
+
 func TestPraxisTenantUsesMaasTenantConfigSelector(t *testing.T) {
 	ait := controllerAITenant("tenant", "models-as-a-service", "tenant-a", "gateway", "gateway-system")
 	mtc := controllerMaasTenantConfig("tenant-a", "tenant", "models-as-a-service", "praxis")

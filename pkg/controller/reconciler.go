@@ -116,7 +116,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// When a guardrail is added, removed or accepted, re-check the
 		// tenant's model routes: they run the guardrail filter only while
 		// the tenant has at least one active guardrail check.
-		Watches(&aigatewayv1alpha1.AIGuardrail{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels),
+		Watches(&aigatewayv1alpha1.AIGuardrail{}, handler.EnqueueRequestsFromMapFunc(r.aiguardrailModels),
 			builder.WithPredicates(inScope, tenant.NemoCalloutChanged())).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
@@ -234,6 +234,29 @@ func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []rec
 		return nil
 	}
 	return r.modelsInNamespace(ctx, obj.GetNamespace())
+}
+
+func (r *Reconciler) aiguardrailModels(ctx context.Context, obj client.Object) []reconcile.Request {
+	if !r.namespaceAllowed(obj.GetNamespace()) {
+		return nil
+	}
+	requests := r.modelsInNamespace(ctx, obj.GetNamespace())
+	resolution, err := r.resolveTenantForNamespace(ctx, obj.GetNamespace())
+	if err != nil || resolution.aitenant == nil {
+		return requests
+	}
+	seen := make(map[types.NamespacedName]struct{}, len(requests))
+	for _, request := range requests {
+		seen[request.NamespacedName] = struct{}{}
+	}
+	for _, request := range r.gatewayAttachedModels(ctx, resolution.aitenant) {
+		if _, ok := seen[request.NamespacedName]; ok {
+			continue
+		}
+		seen[request.NamespacedName] = struct{}{}
+		requests = append(requests, request)
+	}
+	return requests
 }
 
 func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {
