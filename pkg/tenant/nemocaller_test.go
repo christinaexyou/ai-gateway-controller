@@ -326,6 +326,21 @@ func TestAcceptedNemoCalloutsIsolatesBrokenPolicy(t *testing.T) {
 	}
 }
 
+// TestAcceptedNemoCalloutsSkipsEmptyEndpoint pins that an accepted policy
+// with no providerEndpoint is left out. The binding has nothing to compile
+// against, and that is not a compile failure of the policies that do.
+func TestAcceptedNemoCalloutsSkipsEmptyEndpoint(t *testing.T) {
+	ready := acceptedPolicy("ready", 3, 3, "http://nemo.infra.svc.cluster.local")
+	empty := acceptedPolicy("empty", 3, 3, "")
+	callouts, err := calloutsFor(t, ready, empty)
+	if err != nil {
+		t.Fatalf("acceptedNemoCallouts: %v", err)
+	}
+	if len(callouts) != 1 || callouts[0].name != "ready" || callouts[0].endpoint != ready.Status.ProviderEndpoint {
+		t.Fatalf("callouts = %#v, want only the policy that publishes an endpoint", callouts)
+	}
+}
+
 func parseCompiled(t *testing.T, config string) (map[string]any, []any) {
 	t.Helper()
 	var doc map[string]any
