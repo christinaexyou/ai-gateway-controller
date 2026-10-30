@@ -132,13 +132,17 @@ spec:
                     - ref
                     type: object
                   timeout:
-                    description: Timeout is the maximum duration for an individual
-                      provider call.
+                    description: |-
+                      Timeout is the maximum duration for an individual provider call.
+                      Praxis records it in whole milliseconds and rejects zero, so a
+                      duration below 1ms is invalid.
                     maxLength: 64
                     type: string
                     x-kubernetes-validations:
                     - message: timeout must be a valid positive duration
                       rule: duration(self) > duration('0s')
+                    - message: timeout must be at least 1ms
+                      rule: duration(self) >= duration('1ms')
                 required:
                 - nemo
                 - timeout

@@ -163,6 +163,9 @@ func NemoCalloutChanged() predicate.Funcs {
 }
 
 func nemoCalloutFrom(policy *aigatewayv1alpha1.AIGuardrail) (nemoCallout, error) {
+	if guardrail.ProviderTimeoutTooFine(policy.Spec.Provider.Timeout.Duration) {
+		return nemoCallout{}, fmt.Errorf("AIGuardrail %s/%s timeout %s is below 1ms", policy.Namespace, policy.Name, policy.Spec.Provider.Timeout.Duration)
+	}
 	namespace, err := nemoServiceNamespace(policy.Status.ProviderEndpoint, policy.Spec.Provider.Nemo.Ref.Name)
 	if err != nil {
 		return nemoCallout{}, err
@@ -364,8 +367,11 @@ func nemoFilterEntry(filter nemoFilter) map[string]any {
 		"endpoint":   filter.endpoint,
 		"guardrails": map[string]any{"config_ids": []any{filter.configID}},
 	}
-	if filter.timeout > 0 {
-		provider["timeout_ms"] = filter.timeout.Milliseconds()
+	// A positive duration below 1ms truncates to 0, which Praxis rejects.
+	// nemoCalloutFrom already excludes that policy; this keeps a missed
+	// check from writing timeout_ms: 0 into the shared config.
+	if ms := filter.timeout.Milliseconds(); ms > 0 {
+		provider["timeout_ms"] = ms
 	}
 	return map[string]any{
 		"filter": "ai_guardrails",

@@ -347,6 +347,37 @@ func TestAcceptedNemoCalloutsIsolatesBrokenPolicy(t *testing.T) {
 	}
 }
 
+// TestAcceptedNemoCalloutsRejectsSubMillisecondTimeout pins the boundary
+// Praxis can represent. 1ms is rendered as timeout_ms 1. 500us would become
+// timeout_ms 0, which Praxis rejects, so that policy is left out and the
+// sibling is kept.
+func TestAcceptedNemoCalloutsRejectsSubMillisecondTimeout(t *testing.T) {
+	ready := acceptedPolicy("ready", 3, 3, "http://nemo.infra.svc.cluster.local")
+	ready.Spec.Provider.Timeout.Duration = time.Millisecond
+	fine := acceptedPolicy("fine", 3, 3, "http://nemo.infra.svc.cluster.local")
+	fine.Spec.Provider.Timeout.Duration = 500 * time.Microsecond
+	callouts, err := calloutsFor(t, ready, fine)
+	if !errors.Is(err, errUncompilableCallout) {
+		t.Fatalf("acceptedNemoCallouts error = %v, want %v", err, errUncompilableCallout)
+	}
+	if len(callouts) != 1 || callouts[0].name != "ready" || callouts[0].timeout != time.Millisecond {
+		t.Fatalf("callouts = %#v, want only the 1ms policy", callouts)
+	}
+	entry := nemoFilterEntry(nemoFilter{endpoint: callouts[0].endpoint, configID: "pii-v1", header: "h", timeout: callouts[0].timeout, request: true})
+	provider, ok := entry["provider"].(map[string]any)
+	if !ok || provider["timeout_ms"] != int64(1) {
+		t.Fatalf("provider = %v, want timeout_ms 1", entry["provider"])
+	}
+	omitted := nemoFilterEntry(nemoFilter{timeout: 500 * time.Microsecond, request: true})
+	omittedProvider, ok := omitted["provider"].(map[string]any)
+	if !ok {
+		t.Fatalf("provider = %v, want a map", omitted["provider"])
+	}
+	if _, set := omittedProvider["timeout_ms"]; set {
+		t.Fatal("a sub-millisecond timeout was rendered")
+	}
+}
+
 // TestAcceptedNemoCalloutsSkipsEmptyEndpoint pins that an accepted policy
 // with no providerEndpoint is left out. The binding has nothing to compile
 // against, and that is not a compile failure of the policies that do.
