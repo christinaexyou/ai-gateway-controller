@@ -102,7 +102,7 @@ func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNames
 	var rejected []error
 	for i := range policies.Items {
 		policy := &policies.Items[i]
-		if !guardrail.BindingAccepted(policy) || policy.Status.ProviderEndpoint == "" {
+		if policy.Status.ProviderEndpoint == "" {
 			continue
 		}
 		callout, err := nemoCalloutFrom(policy)
