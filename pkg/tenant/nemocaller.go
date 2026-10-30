@@ -48,9 +48,6 @@ const (
 	// to it; OpenShift matches NetworkPolicy egress against the pod port.
 	nemoServerPort int64 = 8000
 
-	// nemoCheckModel is the fixed model Praxis sends on POST /v1/checks.
-	// NeMo owns the task model inside the selected configuration.
-	nemoCheckModel = "check-model"
 	nemoChecksPath = "/v1/checks"
 )
 
@@ -345,12 +342,13 @@ func insertAfterRequestID(doc map[string]any, entries []any) bool {
 }
 
 // nemoFilterEntry runs one check when its selection header is "true". A
-// request that skips the check also skips its response hook.
+// request that skips the check also skips its response hook. The model is
+// omitted so NeMo calls the model named in the selected configuration
+// rather than a name this controller invents.
 func nemoFilterEntry(filter nemoFilter) map[string]any {
 	provider := map[string]any{
 		"type":       "nemo",
 		"endpoint":   filter.endpoint,
-		"model":      nemoCheckModel,
 		"guardrails": map[string]any{"config_ids": []any{filter.configID}},
 	}
 	if filter.timeout > 0 {

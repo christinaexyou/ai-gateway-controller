@@ -113,8 +113,8 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 			provider["endpoint"] != w.endpoint || phase["request"] != w.request || phase["response"] != w.response {
 			t.Fatalf("check %d = %v, want %+v (input order, then reversed output order)", i, entry, w)
 		}
-		if provider["model"] != nemoCheckModel {
-			t.Fatalf("check %d model = %v, want %s", i, provider["model"], nemoCheckModel)
+		if _, set := provider["model"]; set {
+			t.Fatalf("check %d sets model = %v; NeMo must keep the model from its configuration", i, provider["model"])
 		}
 		conditions, _ := entry["conditions"].([]any)
 		var when map[string]any

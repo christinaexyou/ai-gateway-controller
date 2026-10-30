@@ -14,7 +14,6 @@ filter_chains:
       guardrails:
         config_ids:
         - pii-v1
-      model: check-model
       timeout_ms: 5000
       type: nemo
   - conditions:
@@ -30,7 +29,6 @@ filter_chains:
       guardrails:
         config_ids:
         - pii-v1
-      model: check-model
       timeout_ms: 5000
       type: nemo
   - filter: headers
