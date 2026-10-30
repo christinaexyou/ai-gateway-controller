@@ -242,7 +242,16 @@ func (r *Reconciler) aiguardrailModels(ctx context.Context, obj client.Object) [
 	}
 	requests := r.modelsInNamespace(ctx, obj.GetNamespace())
 	resolution, err := r.resolveTenantForNamespace(ctx, obj.GetNamespace())
-	if err != nil || resolution.aitenant == nil {
+	if err != nil {
+		// Only the namespace-local models are enqueued, so a gateway-attached
+		// model keeps ipp.disabled=true until some other watched event
+		// reaches it. A MapFunc cannot ask for a retry, so this is logged to
+		// make that delay attributable rather than silent.
+		r.Log.Error(err, "resolve tenant for AIGuardrail event; gateway-attached models were not enqueued",
+			"namespace", obj.GetNamespace(), "aiguardrail", obj.GetName())
+		return requests
+	}
+	if resolution.aitenant == nil {
 		return requests
 	}
 	seen := make(map[types.NamespacedName]struct{}, len(requests))

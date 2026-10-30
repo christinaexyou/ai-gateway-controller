@@ -276,17 +276,34 @@ func TestNemoCalloutContract(t *testing.T) {
 	}
 }
 
-func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
+// TestAcceptedNemoCalloutsKeepsAPolicyAwaitingReacceptance pins which
+// policies reach the compiler. Acceptance is read through
+// status.providerEndpoint: the guardrail reconciler publishes it with the
+// binding revision and clears both when it refuses, so an empty one is the
+// refusal.
+//
+// A policy whose status has not caught up with a spec edit still compiles.
+// Dropping its checks for the length of that round trip would leave requests
+// unscreened because the spec changed, which is when screening matters most.
+// What compiles in that window is the live spec; the accepted one is not
+// recorded anywhere to compile instead.
+func TestAcceptedNemoCalloutsKeepsAPolicyAwaitingReacceptance(t *testing.T) {
 	current := acceptedPolicy("current", 3, 3, "http://nemo.infra.svc.cluster.local")
 	stale := acceptedPolicy("stale", 4, 3, "http://nemo.infra.svc.cluster.local")
-	refused := acceptedPolicy("refused", 3, 3, "http://nemo.infra.svc.cluster.local")
+	// What refuse() leaves behind: the condition flipped and both published
+	// binding fields cleared.
+	refused := acceptedPolicy("refused", 3, 3, "")
 	refused.Status.Conditions[0].Status = metav1.ConditionFalse
+	refused.Status.BindingRevision = ""
 	callouts, err := calloutsFor(t, current, stale, refused)
 	if err != nil {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
-	if len(callouts) != 1 || callouts[0].name != "current" || len(callouts[0].checks) != 1 || !callouts[0].checks[0].request || callouts[0].checks[0].response {
-		t.Fatalf("callouts = %#v, want only the current input policy", callouts)
+	if len(callouts) != 2 || callouts[0].name != "current" || callouts[1].name != "stale" {
+		t.Fatalf("callouts = %#v, want the current and the awaiting-reacceptance policy, not the refused one", callouts)
+	}
+	if len(callouts[0].checks) != 1 || !callouts[0].checks[0].request || callouts[0].checks[0].response {
+		t.Fatalf("checks = %#v, want one input check", callouts[0].checks)
 	}
 	if callouts[0].serviceNamespace != "infra" {
 		t.Fatalf("namespace = %q, want infra from the Service host", callouts[0].serviceNamespace)
