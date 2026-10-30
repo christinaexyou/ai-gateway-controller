@@ -58,7 +58,7 @@ func testGuardrailTimeoutAdmission(t *testing.T, c client.Client) {
 				assert.ErrorContains(t, err, "spec.provider.timeout")
 				message := tc.message
 				if message == "" {
-					message = "timeout must be a valid positive duration"
+					message = "timeout must be at least 1ms"
 				}
 				assert.ErrorContains(t, err, message)
 				return
