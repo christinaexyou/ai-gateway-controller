@@ -221,10 +221,11 @@ func nemoServiceNamespace(endpoint, provider string) (string, error) {
 	default:
 		return "", fmt.Errorf("provider endpoint %q must be the NeMo base URL", endpoint)
 	}
+	// The provider name is a DNS subdomain, so it may contain dots. Cutting the
+	// host at the first dot would treat "my.rails.infra.svc" as service "my".
 	host := strings.TrimSuffix(parsed.Hostname(), ".cluster.local")
-	name, rest, _ := strings.Cut(host, ".")
-	namespace, svc, _ := strings.Cut(rest, ".")
-	if name != provider || svc != "svc" || len(validation.IsDNS1123Label(namespace)) > 0 {
+	namespace, svc, _ := strings.Cut(strings.TrimPrefix(host, provider+"."), ".")
+	if !strings.HasPrefix(host, provider+".") || svc != "svc" || len(validation.IsDNS1123Label(namespace)) > 0 {
 		return "", fmt.Errorf("provider endpoint %q is not the in-cluster Service of NemoGuardrails %q", endpoint, provider)
 	}
 	return namespace, nil

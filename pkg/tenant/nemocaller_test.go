@@ -186,6 +186,16 @@ func TestConfigureNemoCalloutsWithoutNetworkPolicy(t *testing.T) {
 	}
 }
 
+func TestNemoServiceNamespaceAllowsDottedProviderName(t *testing.T) {
+	namespace, err := nemoServiceNamespace("http://my.rails.infra.svc.cluster.local", "my.rails")
+	if err != nil || namespace != "infra" {
+		t.Fatalf("namespace = %q, err = %v, want infra", namespace, err)
+	}
+	if _, err := nemoServiceNamespace("http://my.other.infra.svc.cluster.local", "my.rails"); err == nil {
+		t.Fatal("accepted a Service whose name is only a prefix of the provider")
+	}
+}
+
 func TestCompileNemoExtprocRequiresRequestIDFilter(t *testing.T) {
 	callouts := []nemoCallout{{name: "safety", endpoint: "http://nemo.infra.svc", checks: []nemoCheck{{configID: "pii-v1", request: true}}}}
 	if _, err := compileNemoExtproc("filter_chains:\n  - name: ipp\n    filters: []\n", callouts); err == nil {
