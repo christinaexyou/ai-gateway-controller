@@ -150,7 +150,10 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 	if len(egress) != 2 {
 		t.Fatalf("egress = %v, want the rendered rule plus one NeMo rule", egress)
 	}
-	rule, _ := egress[1].(map[string]any)
+	rule, ok := egress[1].(map[string]any)
+	if !ok {
+		t.Fatalf("NeMo egress rule = %v, want a map", egress[1])
+	}
 	ports, _ := rule["ports"].([]any)
 	port, _ := ports[0].(map[string]any)
 	if len(ports) != 1 || port["port"] != nemoServerPort || port["protocol"] != "TCP" {
@@ -159,7 +162,14 @@ func TestConfigureNemoCalloutsCompilesAcceptedEndpoint(t *testing.T) {
 	var namespaces []string
 	peers, _ := rule["to"].([]any)
 	for _, peer := range peers {
-		labels, _, _ := unstructured.NestedStringMap(peer.(map[string]any), "namespaceSelector", "matchLabels")
+		peerMap, ok := peer.(map[string]any)
+		if !ok {
+			t.Fatalf("egress peer = %v, want a map", peer)
+		}
+		labels, _, err := unstructured.NestedStringMap(peerMap, "namespaceSelector", "matchLabels")
+		if err != nil {
+			t.Fatalf("egress peer labels: %v", err)
+		}
 		namespaces = append(namespaces, labels["kubernetes.io/metadata.name"])
 	}
 	if len(namespaces) != 2 || namespaces[0] != "infra" || namespaces[1] != "other" {
@@ -202,7 +212,7 @@ func TestCompileNemoExtprocRequiresRequestIDFilter(t *testing.T) {
 		t.Fatal("compiled checks into a chain with no request_id anchor")
 	}
 	if _, err := compileNemoExtproc("filter_chains: [", callouts); err == nil {
-		t.Fatal("compiled checks into an unparseable config")
+		t.Fatal("compiled checks into an unparsable config")
 	}
 }
 
@@ -308,6 +318,7 @@ func TestAcceptedNemoCalloutsUseCheckSelectionHeader(t *testing.T) {
 // cannot be compiled is left out instead of failing the whole tenant.
 func TestAcceptedNemoCalloutsIsolatesBrokenPolicy(t *testing.T) {
 	good := acceptedPolicy("good", 3, 3, "http://nemo.infra.svc")
+	//nolint:gosec // G101: the userinfo entry is a fixture URL the compiler must reject, not a credential
 	broken := map[string]string{
 		"external-host":  "http://attacker.example",
 		"other-service":  "http://other.infra.svc",
