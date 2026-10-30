@@ -446,9 +446,12 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
 	}
-	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace, log)
-	if err != nil {
+	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace)
+	if err != nil && !errors.Is(err, errUncompilableCallout) {
 		return ctrl.Result{}, err
+	}
+	if err != nil {
+		log.Error(err, "leaving uncompilable AIGuardrails out of the ExtProc config")
 	}
 	if err := configureNemoCallouts(resources, tenantID, gatewayNamespace, callouts); err != nil {
 		return ctrl.Result{}, fmt.Errorf("compile NeMo callouts: %w", err)

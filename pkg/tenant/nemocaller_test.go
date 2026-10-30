@@ -18,13 +18,13 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -261,7 +261,10 @@ func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
 	stale := acceptedPolicy("stale", 4, 3, "http://nemo.infra.svc.cluster.local")
 	refused := acceptedPolicy("refused", 3, 3, "http://nemo.infra.svc.cluster.local")
 	refused.Status.Conditions[0].Status = metav1.ConditionFalse
-	callouts := calloutsFor(t, current, stale, refused)
+	callouts, err := calloutsFor(t, current, stale, refused)
+	if err != nil {
+		t.Fatalf("acceptedNemoCallouts: %v", err)
+	}
 	if len(callouts) != 1 || callouts[0].name != "current" || len(callouts[0].checks) != 1 || !callouts[0].checks[0].request || callouts[0].checks[0].response {
 		t.Fatalf("callouts = %#v, want only the current input policy", callouts)
 	}
@@ -275,7 +278,10 @@ func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
 // AIGuardrail name and check name, not its NeMo config ID.
 func TestAcceptedNemoCalloutsUseCheckSelectionHeader(t *testing.T) {
 	policy := acceptedPolicy("safety", 3, 3, "http://nemo.infra.svc")
-	callouts := calloutsFor(t, policy)
+	callouts, err := calloutsFor(t, policy)
+	if err != nil {
+		t.Fatalf("acceptedNemoCallouts: %v", err)
+	}
 	if len(callouts) != 1 || len(callouts[0].checks) != 1 {
 		t.Fatalf("callouts = %#v, want one check", callouts)
 	}
@@ -311,7 +317,10 @@ func TestAcceptedNemoCalloutsIsolatesBrokenPolicy(t *testing.T) {
 	noConfig := acceptedPolicy("no-config", 3, 3, "http://nemo.infra.svc")
 	noConfig.Spec.Checks[0].ConfigID = ""
 	policies = append(policies, noConfig)
-	callouts := calloutsFor(t, policies...)
+	callouts, err := calloutsFor(t, policies...)
+	if !errors.Is(err, errUncompilableCallout) {
+		t.Fatalf("acceptedNemoCallouts error = %v, want %v", err, errUncompilableCallout)
+	}
 	if len(callouts) != 1 || callouts[0].name != "good" {
 		t.Fatalf("callouts = %#v, want only the valid policy", callouts)
 	}
@@ -332,17 +341,17 @@ func parseCompiled(t *testing.T, config string) (map[string]any, []any) {
 	return doc, filters
 }
 
-func calloutsFor(t *testing.T, policies ...*aigatewayv1alpha1.AIGuardrail) []nemoCallout {
+func calloutsFor(t *testing.T, policies ...*aigatewayv1alpha1.AIGuardrail) ([]nemoCallout, error) {
 	t.Helper()
 	builder := fake.NewClientBuilder().WithScheme(mtcSchemeForTests())
 	for _, policy := range policies {
 		builder = builder.WithObjects(policy)
 	}
-	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a", logr.Discard())
-	if err != nil {
+	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a")
+	if err != nil && !errors.Is(err, errUncompilableCallout) {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
-	return callouts
+	return callouts, err
 }
 
 // acceptedPolicy references NemoGuardrails "nemo" and has an Accepted

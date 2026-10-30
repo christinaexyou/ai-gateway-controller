@@ -27,7 +27,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,6 +49,11 @@ const (
 
 	nemoChecksPath = "/v1/checks"
 )
+
+// errUncompilableCallout is returned, joined with one error per policy, when
+// an accepted AIGuardrail cannot be compiled. The callouts returned alongside
+// it are the policies that compiled; one bad policy does not drop the others.
+var errUncompilableCallout = errors.New("accepted AIGuardrail cannot be compiled")
 
 // nemoCallout is one accepted AIGuardrail. Each of its checks is compiled
 // as its own ai_guardrails filter on the shared post-auth ExtProc.
@@ -85,15 +89,17 @@ type nemoFilter struct {
 }
 
 // acceptedNemoCallouts returns the tenant's current accepted NeMo callouts.
-// A refused, stale or deleting policy is left out. A policy that cannot be
-// compiled is logged and left out; it must not take the other policies or
-// the rest of the tenant down with it.
-func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string, log logr.Logger) ([]nemoCallout, error) {
+// A refused, stale, deleting, or endpoint-less policy is left out. A policy
+// that cannot be compiled is also left out and reported through
+// errUncompilableCallout, so the caller can surface it without dropping the
+// policies that did compile or failing the rest of the tenant.
+func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string) ([]nemoCallout, error) {
 	var policies aigatewayv1alpha1.AIGuardrailList
 	if err := reader.List(ctx, &policies, client.InNamespace(tenantNamespace)); err != nil {
 		return nil, fmt.Errorf("list AIGuardrails in %s: %w", tenantNamespace, err)
 	}
 	callouts := make([]nemoCallout, 0, len(policies.Items))
+	var rejected []error
 	for i := range policies.Items {
 		policy := &policies.Items[i]
 		if !guardrail.BindingAccepted(policy) || policy.Status.ProviderEndpoint == "" {
@@ -101,12 +107,15 @@ func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNames
 		}
 		callout, err := nemoCalloutFrom(policy)
 		if err != nil {
-			log.Error(err, "AIGuardrail is accepted but cannot be compiled; leaving it out", "aiguardrail", client.ObjectKeyFromObject(policy))
+			rejected = append(rejected, err)
 			continue
 		}
 		callouts = append(callouts, callout)
 	}
 	sort.Slice(callouts, func(i, j int) bool { return callouts[i].name < callouts[j].name })
+	if len(rejected) > 0 {
+		return callouts, fmt.Errorf("%w: %w", errUncompilableCallout, errors.Join(rejected...))
+	}
 	return callouts, nil
 }
 
@@ -114,8 +123,11 @@ func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNames
 // least one NeMo check. ExternalModel routes keep that filter enabled only
 // then.
 func HasNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string) (bool, error) {
-	callouts, err := acceptedNemoCallouts(ctx, reader, tenantNamespace, logr.Discard())
-	return len(callouts) > 0, err
+	callouts, err := acceptedNemoCallouts(ctx, reader, tenantNamespace)
+	if err != nil && !errors.Is(err, errUncompilableCallout) {
+		return false, err
+	}
+	return len(callouts) > 0, nil
 }
 
 // nemoCalloutInputs is everything acceptedNemoCallouts reads from a policy.
