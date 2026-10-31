@@ -4,6 +4,7 @@ package envtest_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +22,9 @@ import (
 	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	inferencev1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/guardrail"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/publisher"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
 
 // externalModelFinalizer is pinned rather than imported: it is stored on live
@@ -144,6 +147,58 @@ func awaitModelPublished(t *testing.T, c client.Client, model *inferencev1alpha1
 		routeName = actual.Status.HTTPRouteName
 	}, eventuallyTimeout, pollInterval, "the requested model and provider must be published with their workload")
 	return routeName
+}
+
+// awaitGuardrailEnforced accepts one guardrail and waits until the tenant
+// post-auth config calls it and the ExternalModel route filter leaves that
+// config enabled. Envtest has no Envoy or NeMo, so this checks the objects
+// the dataplane would enforce, not a live blocked request.
+func awaitGuardrailEnforced(t *testing.T, c client.Client, namespace string) {
+	t.Helper()
+	policy := aiGuardrail("safety", namespace)
+	require.NoError(t, c.Create(t.Context(), policy))
+	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(policy), policy))
+	policy.Status = aigatewayv1alpha1.AIGuardrailStatus{
+		BindingRevision:  "rev",
+		ProviderEndpoint: "http://guardrails.infra.svc",
+		Conditions: []metav1.Condition{{
+			Type:               guardrail.ConditionAccepted,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Accepted",
+			Message:            "provider binding accepted",
+			ObservedGeneration: policy.Generation,
+			LastTransitionTime: metav1.Now(),
+		}},
+	}
+	require.NoError(t, c.Status().Update(t.Context(), policy))
+
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		var config corev1.ConfigMap
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{
+			Namespace: gatewayNamespace, Name: tenant.PayloadProcessingPluginsConfigMapForTenant(namespace),
+		}, &config))
+		extproc := config.Data["extproc.yaml"]
+		require.Contains(collect, extproc, "filter: ai_guardrails")
+		require.Contains(collect, extproc, "safety")
+
+		filter := &unstructured.Unstructured{}
+		filter.SetAPIVersion("networking.istio.io/v1alpha3")
+		filter.SetKind("EnvoyFilter")
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{
+			Namespace: gatewayNamespace, Name: tenant.PayloadProcessingExternalModelEnvoyFilterName(namespace),
+		}, filter))
+		patches, _, err := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+		require.NoError(collect, err)
+		require.NotEmpty(collect, patches)
+		for _, raw := range patches {
+			patch, ok := raw.(map[string]any)
+			require.True(collect, ok, "route patch = %T, want a map", raw)
+			disabled, found, nestedErr := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp", "disabled")
+			require.NoError(collect, nestedErr)
+			require.False(collect, found && disabled, "ExternalModel route disabled the guardrail filter")
+		}
+		require.False(collect, strings.Contains(extproc, "static_response"), "the accepted check must be called, not rejected")
+	}, eventuallyTimeout, pollInterval, "the accepted guardrail must be compiled and left on for ExternalModel routes")
 }
 
 func awaitModelRemoved(t *testing.T, c client.Client, model *inferencev1alpha1.ExternalModel, routeName string) {

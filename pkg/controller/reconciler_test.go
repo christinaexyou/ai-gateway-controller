@@ -25,13 +25,62 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
+	"github.com/opendatahub-io/ai-gateway-controller/pkg/guardrail"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/publisher"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/render"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/resolver"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/tenant"
 )
+
+// TestEnableExternalModelRoutesKeepsPostAuthForCompiledChecks pins that a
+// tenant with a compiled NeMo check keeps the shared post-auth filter on its
+// ExternalModel routes, so those requests are checked too.
+func TestEnableExternalModelRoutesKeepsPostAuthForCompiledChecks(t *testing.T) {
+	policy := &aigatewayv1alpha1.AIGuardrail{
+		ObjectMeta: metav1.ObjectMeta{Name: "safety", Namespace: "tenant-a", Generation: 1},
+		Spec: aigatewayv1alpha1.AIGuardrailSpec{
+			Provider: aigatewayv1alpha1.AIGuardrailProvider{
+				Nemo: aigatewayv1alpha1.AIGuardrailNemoProvider{Ref: aigatewayv1alpha1.AIGuardrailNamespacedReference{Name: "nemo"}},
+			},
+			Checks: []aigatewayv1alpha1.AIGuardrailCheck{{
+				Name: "pii", ConfigID: "pii-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput},
+			}},
+		},
+		Status: aigatewayv1alpha1.AIGuardrailStatus{
+			BindingRevision:  "rev",
+			ProviderEndpoint: "http://nemo.nemo-infra.svc.cluster.local",
+			Conditions: []metav1.Condition{{
+				Type: guardrail.ConditionAccepted, Status: metav1.ConditionTrue, ObservedGeneration: 1,
+			}},
+		},
+	}
+	r := controllerTestClient(t, policy)
+	var applied unstructured.Unstructured
+	r.ApplyResource = func(_ context.Context, _ client.Client, object unstructured.Unstructured) error {
+		applied = *object.DeepCopy()
+		return nil
+	}
+	routes := []resolver.Route{{Model: "demo-model", ClientName: "demo", Provider: "provider-a"}}
+	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
+		t.Fatal(err)
+	}
+	patches := nestedSlice(t, applied.Object, "spec", "configPatches")
+	if len(patches) == 0 {
+		t.Fatal("no route patches were written")
+	}
+	for _, raw := range patches {
+		patch, _ := raw.(map[string]any)
+		if _, found, _ := unstructured.NestedMap(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp"); found {
+			t.Fatalf("route patch %v disables the post-auth checks filter", patch["match"])
+		}
+		if disabled, _, _ := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp-pre", "disabled"); !disabled {
+			t.Fatalf("route patch %v left the shared pre-auth filter on", patch["match"])
+		}
+	}
+}
 
 func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 	t.Helper()
@@ -40,6 +89,9 @@ func controllerTestClient(t *testing.T, objects ...client.Object) *Reconciler {
 		t.Fatal(err)
 	}
 	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := aigatewayv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	scheme.AddKnownTypeWithName(schema.GroupVersionKind{Group: "networking.istio.io", Version: "v1alpha3", Kind: "EnvoyFilter"}, &unstructured.Unstructured{})
@@ -970,6 +1022,49 @@ func TestMaasTenantConfigEventsFanOutOnlyWithinConfigNamespace(t *testing.T) {
 	r.Namespace = "tenant-a"
 	if got := r.maasTenantConfigModels(context.Background(), other); len(got) != 0 {
 		t.Fatalf("out-of-scope MaaS TenantConfig event enqueued %#v", got)
+	}
+}
+
+func TestAIGuardrailEventsEnqueueTenantAndGatewayAttachedModels(t *testing.T) {
+	tenantGateway := v1alpha1.NamespacedObjectReference{Name: "gateway", Namespace: "gateway-system"}
+	tenantModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "tenant", Namespace: "tenant-a"}, Spec: v1alpha1.ExternalModelSpec{GatewayRefs: []v1alpha1.NamespacedObjectReference{tenantGateway}}}
+	attachedModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "attached", Namespace: "team-a"}, Spec: v1alpha1.ExternalModelSpec{GatewayRefs: []v1alpha1.NamespacedObjectReference{tenantGateway}}}
+	unrelatedModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "team-b"}, Spec: v1alpha1.ExternalModelSpec{GatewayRefs: []v1alpha1.NamespacedObjectReference{gatewayB}}}
+	guardrail := &aigatewayv1alpha1.AIGuardrail{ObjectMeta: metav1.ObjectMeta{Name: "safety", Namespace: "tenant-a"}}
+	ait := controllerAITenant("tenant-a", "models-as-a-service", "tenant-a", tenantGateway.Name, tenantGateway.Namespace)
+	mtc := controllerMaasTenantConfig("tenant-a", "tenant-a", "models-as-a-service", "praxis")
+	r := controllerTestClient(t, tenantModel, attachedModel, unrelatedModel, guardrail, ait, mtc)
+
+	want := map[types.NamespacedName]bool{
+		client.ObjectKeyFromObject(tenantModel):   true,
+		client.ObjectKeyFromObject(attachedModel): true,
+	}
+	got := r.aiguardrailModels(context.Background(), guardrail)
+	if len(got) != len(want) {
+		t.Fatalf("AIGuardrail event enqueued %#v, want %#v", got, want)
+	}
+	for _, request := range got {
+		if !want[request.NamespacedName] {
+			t.Fatalf("AIGuardrail event unexpectedly enqueued %s", request.NamespacedName)
+		}
+		delete(want, request.NamespacedName)
+	}
+	if len(want) != 0 {
+		t.Fatalf("AIGuardrail event missed %#v", want)
+	}
+}
+
+func TestDefaultTenantAIGuardrailEventsEnqueueImplicitModels(t *testing.T) {
+	implicitModel := &v1alpha1.ExternalModel{ObjectMeta: metav1.ObjectMeta{Name: "implicit", Namespace: "team-a"}}
+	guardrail := &aigatewayv1alpha1.AIGuardrail{ObjectMeta: metav1.ObjectMeta{Name: "safety", Namespace: "models-as-a-service"}}
+	defaultTenant := controllerAITenant(tenant.DefaultAITenantName, "models-as-a-service", "models-as-a-service", defaultGateway.Name, defaultGateway.Namespace)
+	mtc := controllerMaasTenantConfig("models-as-a-service", tenant.DefaultAITenantName, "models-as-a-service", "praxis")
+	r := controllerTestClient(t, implicitModel, guardrail, defaultTenant, mtc)
+
+	got := r.aiguardrailModels(context.Background(), guardrail)
+	want := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(implicitModel)}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("default tenant AIGuardrail event enqueued %#v, want %#v", got, want)
 	}
 }
 

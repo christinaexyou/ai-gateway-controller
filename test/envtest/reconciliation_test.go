@@ -43,4 +43,19 @@ func TestControlPlane(t *testing.T) {
 		// Then its routing and workload are removed and the finalizer releases it.
 		awaitModelRemoved(t, c, model, routeName)
 	})
+
+	t.Run("an accepted guardrail is enforced on ExternalModel routes", func(t *testing.T) {
+		const namespace = "guardrail-enforcement"
+		maas := maasFixture{client: c}
+		maas.existingPraxisTenant(t, namespace)
+		awaitPraxisInstalled(t, c, namespace)
+		provider := createProvider(t, c, namespace)
+		model := externalModel("model", namespace,
+			withModelName("chat"),
+			withProviderModel(provider.Name, "provider-model"),
+		)
+		require.NoError(t, c.Create(t.Context(), model))
+		awaitModelPublished(t, c, model, provider)
+		awaitGuardrailEnforced(t, c, namespace)
+	})
 }
