@@ -127,7 +127,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForRoutingOverlay)).
 		Watches(&aigatewayv1alpha1.AIGuardrail{},
 			handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace),
-			builder.WithPredicates(NemoCalloutChanged())).
+			builder.WithPredicates(nemoCalloutChanged())).
 		Watches(newMaaSSubscription(), handler.EnqueueRequestsFromMapFunc(r.maasTenantConfigForNamespace)).
 		Watches(newMaaSModelRef(), handler.EnqueueRequestsFromMapFunc(r.enqueueMaasTenantConfigForModelRef)).
 		Complete(r)
@@ -173,15 +173,13 @@ func (r *Reconciler) enqueueMaasTenantConfigForModelRef(ctx context.Context, obj
 			add(obj.GetNamespace())
 		}
 	}
-	subscriptions, err := listUnstructured(ctx, r.Client, MaaSSubscriptionGVK, "")
+	naming, err := subscriptionNamespacesNaming(ctx, r.Client, obj.GetNamespace(), obj.GetName())
 	if err != nil {
 		r.Log.Error(err, "list MaaSSubscriptions for MaaSModelRef watch")
 		return requests
 	}
-	for i := range subscriptions {
-		if subscriptionNamesModel(&subscriptions[i], obj.GetNamespace(), obj.GetName()) {
-			add(subscriptions[i].GetNamespace())
-		}
+	for _, namespace := range naming {
+		add(namespace)
 	}
 	return requests
 }
@@ -490,7 +488,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		return ctrl.Result{}, err
 	}
 	if err != nil {
-		log.Error(err, "accepted guardrail cannot be called; requests that select it are rejected")
+		log.Error(err, "guardrail catalog is incomplete; affected checks fail closed and the rest are published")
 	}
 	reader := r.APIReader
 	if reader == nil {

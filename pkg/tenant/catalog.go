@@ -35,22 +35,44 @@ type attachmentRef struct {
 	namespace string
 	name      string
 	checks    []string
+	// unreadable is an entry whose policy could not be read. It may name any
+	// tenant policy, so every one is attached rather than none.
+	unreadable bool
 }
 
-// orderNemoCallouts orders checks from the broadest list to the narrowest:
-// AI Tenant, tenant config, subscription, model, then a subscription's model entry.
-// Each list stays in the order it was written. Several objects at one level are
-// ordered by namespace, then name; that does not reorder a list. A check named
-// twice runs the first time. Checks nobody named go last. A bad entry is skipped.
-// A failed API read stops the order.
-func orderNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string, callouts []nemoCallout) ([]nemoCallout, error) {
-	refs, err := catalogAttachments(ctx, reader, tenantNamespace)
-	if err != nil && !errors.Is(err, errMalformedAttachment) {
-		return nil, err
+// unreadableRef stands in for a guardrails entry, or a whole list, that could
+// not be read.
+var unreadableRef = attachmentRef{unreadable: true}
+
+// attachedPolicies returns the names of the tenant's policies that at least
+// one attachment references. all is true when an unreadable entry may
+// reference any of them.
+func attachedPolicies(refs []attachmentRef, tenantNamespace string) (names map[string]bool, all bool) {
+	names = map[string]bool{}
+	for _, ref := range refs {
+		switch {
+		case ref.unreadable:
+			all = true
+		case inTenant(ref, tenantNamespace):
+			names[ref.name] = true
+		}
 	}
-	return applyAttachmentOrder(callouts, refs, tenantNamespace), err
+	return names, all
 }
 
+// inTenant reports whether ref names a policy in the tenant's namespace.
+// A same-named policy stored next to the model is a different policy.
+func inTenant(ref attachmentRef, tenantNamespace string) bool {
+	return !ref.unreadable && (ref.namespace == "" || ref.namespace == tenantNamespace)
+}
+
+// applyAttachmentOrder returns only the checks the attachments select, ordered
+// from the broadest list to the narrowest: AI Tenant, tenant config,
+// subscription, model, then a subscription's model entry. Several objects at one level are ordered by
+// namespace, then name; that does not reorder a list. A check named twice runs
+// the first time. A check no attachment selects is not returned, unless an
+// unreadable entry may select it: then every remaining check runs last, in
+// policy name order.
 func applyAttachmentOrder(callouts []nemoCallout, refs []attachmentRef, tenantNamespace string) []nemoCallout {
 	byName := make(map[string]nemoCallout, len(callouts))
 	for _, callout := range callouts {
@@ -58,36 +80,31 @@ func applyAttachmentOrder(callouts []nemoCallout, refs []attachmentRef, tenantNa
 	}
 	used := map[string]bool{}
 	ordered := make([]nemoCallout, 0, len(callouts))
+	add := func(src nemoCallout, checks []string) {
+		selected := selectCalloutChecks(src, checks, used)
+		if len(selected) == 0 {
+			return
+		}
+		src.checks = selected
+		ordered = append(ordered, src)
+	}
 	for _, ref := range refs {
-		// Use a policy only when it lives in this tenant's namespace.
-		// A same-named policy stored next to the model is a different policy.
-		if ref.namespace != "" && ref.namespace != tenantNamespace {
+		if !inTenant(ref, tenantNamespace) {
 			continue
 		}
-		src, ok := byName[ref.name]
-		if !ok {
-			continue
+		if src, ok := byName[ref.name]; ok {
+			add(src, ref.checks)
 		}
-		selected := selectCalloutChecks(src, ref.checks, used)
-		if len(selected) == 0 {
-			continue
-		}
-		src.checks = selected
-		ordered = append(ordered, src)
 	}
-	names := make([]string, 0, len(byName))
-	for name := range byName {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		src := byName[name]
-		selected := selectCalloutChecks(src, nil, used)
-		if len(selected) == 0 {
-			continue
+	if _, all := attachedPolicies(refs, tenantNamespace); all {
+		names := make([]string, 0, len(byName))
+		for name := range byName {
+			names = append(names, name)
 		}
-		src.checks = selected
-		ordered = append(ordered, src)
+		sort.Strings(names)
+		for _, name := range names {
+			add(byName[name], nil)
+		}
 	}
 	return ordered
 }
@@ -259,7 +276,7 @@ func aiTenantGuardrails(ctx context.Context, reader client.Reader, mtc *unstruct
 func modelRefGuardrails(subscription *unstructured.Unstructured) ([]attachmentRef, error) {
 	entries, found, err := unstructured.NestedSlice(subscription.Object, "spec", "modelRefs")
 	if err != nil {
-		return nil, fmt.Errorf("%w: MaaSSubscription %s spec.modelRefs: %w", errMalformedAttachment, subscription.GetName(), err)
+		return []attachmentRef{unreadableRef}, fmt.Errorf("%w: MaaSSubscription %s spec.modelRefs: %w", errMalformedAttachment, subscription.GetName(), err)
 	}
 	if !found {
 		return nil, nil
@@ -270,6 +287,7 @@ func modelRefGuardrails(subscription *unstructured.Unstructured) ([]attachmentRe
 	for i, entry := range entries {
 		object, ok := entry.(map[string]any)
 		if !ok {
+			refs = append(refs, unreadableRef)
 			problems = append(problems, fmt.Errorf("%s spec.modelRefs[%d] is not an object", owner, i))
 			continue
 		}
@@ -279,6 +297,7 @@ func modelRefGuardrails(subscription *unstructured.Unstructured) ([]attachmentRe
 		}
 		list, ok := raw.([]any)
 		if !ok {
+			refs = append(refs, unreadableRef)
 			problems = append(problems, fmt.Errorf("%s spec.modelRefs[%d].guardrails is not a list", owner, i))
 			continue
 		}
@@ -294,7 +313,7 @@ func modelRefGuardrails(subscription *unstructured.Unstructured) ([]attachmentRe
 func guardrailRefs(obj *unstructured.Unstructured, fields ...string) ([]attachmentRef, error) {
 	raw, found, err := unstructured.NestedSlice(obj.Object, fields...)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s %s guardrails: %w", errMalformedAttachment, obj.GetKind(), obj.GetName(), err)
+		return []attachmentRef{unreadableRef}, fmt.Errorf("%w: %s %s guardrails: %w", errMalformedAttachment, obj.GetKind(), obj.GetName(), err)
 	}
 	if !found {
 		return nil, nil
@@ -306,18 +325,23 @@ func guardrailRefs(obj *unstructured.Unstructured, fields ...string) ([]attachme
 	return parsed, nil
 }
 
+// parseGuardrailRefs fails closed on an entry it cannot fully read. An entry
+// with no readable policy may name any policy; one whose checks cannot be read
+// selects every check of the policy it names.
 func parseGuardrailRefs(owner string, raw []any) ([]attachmentRef, error) {
 	refs := make([]attachmentRef, 0, len(raw))
 	var problems []error
 	for i, item := range raw {
 		entry, ok := item.(map[string]any)
 		if !ok {
+			refs = append(refs, unreadableRef)
 			problems = append(problems, fmt.Errorf("%s guardrails[%d] is not an object", owner, i))
 			continue
 		}
 		ref, _ := entry["ref"].(map[string]any)
 		name, _ := ref["name"].(string)
 		if name == "" {
+			refs = append(refs, unreadableRef)
 			problems = append(problems, fmt.Errorf("%s guardrails[%d] has no ref.name", owner, i))
 			continue
 		}
@@ -325,7 +349,7 @@ func parseGuardrailRefs(owner string, raw []any) ([]attachmentRef, error) {
 		checks, err := stringList(entry["checks"])
 		if err != nil {
 			problems = append(problems, fmt.Errorf("%s guardrails[%d]: %w", owner, i, err))
-			continue
+			checks = nil
 		}
 		refs = append(refs, attachmentRef{namespace: namespace, name: name, checks: checks})
 	}
@@ -381,6 +405,26 @@ func newMaaSSubscription() *unstructured.Unstructured {
 
 func newMaaSModelRef() *unstructured.Unstructured {
 	return newUnstructured(MaaSModelRefGVK)
+}
+
+// subscriptionNamespacesNaming returns, once each, the namespaces of the
+// subscriptions that point at the model.
+func subscriptionNamespacesNaming(ctx context.Context, reader client.Reader, namespace, name string) ([]string, error) {
+	subscriptions, err := listUnstructured(ctx, reader, MaaSSubscriptionGVK, "")
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var namespaces []string
+	for i := range subscriptions {
+		ns := subscriptions[i].GetNamespace()
+		if seen[ns] || !subscriptionNamesModel(&subscriptions[i], namespace, name) {
+			continue
+		}
+		seen[ns] = true
+		namespaces = append(namespaces, ns)
+	}
+	return namespaces, nil
 }
 
 // subscriptionNamesModel reports whether this subscription points at the model.

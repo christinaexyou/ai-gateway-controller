@@ -30,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	aigatewayv1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/aigateway/v1alpha1"
 	v1alpha1 "github.com/opendatahub-io/ai-gateway-controller/api/inference/v1alpha1"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/envelope"
 	"github.com/opendatahub-io/ai-gateway-controller/pkg/publisher"
@@ -103,21 +102,25 @@ type Reconciler struct {
 // Secret and tenant changes also reconcile providers independently of any model.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	inScope := predicate.NewPredicateFuncs(func(obj client.Object) bool { return r.namespaceAllowed(obj.GetNamespace()) })
-	if err := builder.ControllerManagedBy(mgr).
+	models := builder.ControllerManagedBy(mgr).
 		For(&v1alpha1.ExternalModel{}, builder.WithPredicates(inScope)).
 		Watches(&v1alpha1.ExternalProvider{}, handler.EnqueueRequestsFromMapFunc(r.providerModels), builder.WithPredicates(inScope)).
 		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.secretModels), builder.WithPredicates(inScope)).
-		// The tenant reconciler creates the tenant-local Praxis Service. A
-		// model may otherwise publish an HTTPRoute before that Service exists;
-		// Istio can retain ResolvedRefs=False until the route is reconciled
-		// again. Service events are namespace-scoped and therefore only fan out
-		// to models in the affected tenant.
-		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope)).
-		// When a guardrail is added, removed or accepted, re-check the
-		// tenant's model routes: they run the guardrail filter only while
-		// the tenant has at least one active guardrail check.
-		Watches(&aigatewayv1alpha1.AIGuardrail{}, handler.EnqueueRequestsFromMapFunc(r.aiguardrailModels),
-			builder.WithPredicates(inScope, tenant.NemoCalloutChanged())).
+		// The tenant reconciler creates the tenant-local Praxis Service. Service events are namespace-scoped and therefore only affect
+		// models in the affected tenant.
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.serviceModels), builder.WithPredicates(inScope))
+	// Model routes enable the post-auth filter only while the tenant has
+	// post-auth filters, so re-check them when one of those inputs changes.
+	for _, src := range tenant.PostAuthFilterSources() {
+		models = models.Watches(src.Object, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			var requests []reconcile.Request
+			for _, namespace := range src.Tenants(ctx, r.Client, obj) {
+				requests = append(requests, r.postAuthFilterModels(ctx, namespace)...)
+			}
+			return requests
+		}), builder.WithPredicates(src.Predicate))
+	}
+	if err := models.
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewAITenant(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.tenantModels))).
 		// Gateway attachments: route acceptance is reported in HTTPRoute
@@ -275,12 +278,15 @@ func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []rec
 	return r.modelsInNamespace(ctx, obj.GetNamespace())
 }
 
-func (r *Reconciler) aiguardrailModels(ctx context.Context, obj client.Object) []reconcile.Request {
-	if !r.namespaceAllowed(obj.GetNamespace()) {
+// postAuthFilterModels returns the models whose routes are in the tenant:
+// models in its namespace and models attached to its Gateway from other
+// namespaces.
+func (r *Reconciler) postAuthFilterModels(ctx context.Context, tenantNamespace string) []reconcile.Request {
+	if !r.namespaceAllowed(tenantNamespace) {
 		return nil
 	}
-	requests := r.modelsInNamespace(ctx, obj.GetNamespace())
-	resolution, err := r.resolveTenantForNamespace(ctx, obj.GetNamespace())
+	requests := r.modelsInNamespace(ctx, tenantNamespace)
+	resolution, err := r.resolveTenantForNamespace(ctx, tenantNamespace)
 	if err != nil || resolution.aitenant == nil {
 		return requests
 	}
@@ -2019,7 +2025,7 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 			},
 		},
 	}}
-	checks, err := tenant.HasNemoCallouts(ctx, r.Client, modelNamespace)
+	postAuth, err := tenant.HasPostAuthFilters(ctx, r.Client, modelNamespace)
 	if err != nil {
 		return err
 	}
@@ -2114,10 +2120,9 @@ func (r *Reconciler) writeExternalModelRoutes(ctx context.Context, tenantID, mod
 					"disabled": true,
 				},
 			}
-			// The "ipp" filter is where the tenant's guardrail checks run.
-			// Leave it on when the tenant has checks so requests to this
-			// model are screened; otherwise turn it off as before.
-			if !checks {
+			// The "ipp" filter runs the tenant's post-auth filters. Leave it
+			// on when the tenant has any; otherwise turn it off.
+			if !postAuth {
 				perFilter["envoy.filters.http.ext_proc.ipp"] = map[string]any{
 					"@type":    "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute",
 					"disabled": true,

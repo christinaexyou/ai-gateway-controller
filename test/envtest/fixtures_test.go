@@ -149,12 +149,21 @@ func awaitModelPublished(t *testing.T, c client.Client, model *inferencev1alpha1
 	return routeName
 }
 
-// awaitGuardrailEnforced accepts one guardrail and waits until the tenant
-// post-auth config calls it and the ExternalModel route filter leaves that
-// config enabled. Envtest has no Envoy or NeMo, so this checks the objects
-// the dataplane would enforce, not a live blocked request.
-func awaitGuardrailEnforced(t *testing.T, c client.Client, namespace string) {
+// awaitGuardrailEnforced accepts one guardrail, attaches it through a
+// subscription, and waits until the tenant post-auth config calls it and the
+// ExternalModel route filter leaves that config enabled. It returns the
+// subscription. Envtest has no Envoy or NeMo, so this checks the objects the
+// dataplane would enforce, not a live blocked request.
+func awaitGuardrailEnforced(t *testing.T, c client.Client, namespace string) *unstructured.Unstructured {
 	t.Helper()
+	subscription := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"guardrails": []any{map[string]any{"ref": map[string]any{"name": "safety"}}}},
+	}}
+	subscription.SetGroupVersionKind(tenant.MaaSSubscriptionGVK)
+	subscription.SetName("team")
+	subscription.SetNamespace(namespace)
+	require.NoError(t, c.Create(t.Context(), subscription))
+
 	policy := aiGuardrail("safety", namespace)
 	require.NoError(t, c.Create(t.Context(), policy))
 	require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(policy), policy))
@@ -199,6 +208,39 @@ func awaitGuardrailEnforced(t *testing.T, c client.Client, namespace string) {
 		}
 		require.False(collect, strings.Contains(extproc, "static_response"), "the accepted check must be called, not rejected")
 	}, eventuallyTimeout, pollInterval, "the accepted guardrail must be compiled and left on for ExternalModel routes")
+	return subscription
+}
+
+// awaitGuardrailDetached removes the guardrail's only attachment and waits
+// until the post-auth config no longer calls it and the ExternalModel routes
+// turn the post-auth filter off.
+func awaitGuardrailDetached(t *testing.T, c client.Client, namespace string, attachment *unstructured.Unstructured) {
+	t.Helper()
+	require.NoError(t, c.Delete(t.Context(), attachment))
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		var config corev1.ConfigMap
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{
+			Namespace: gatewayNamespace, Name: tenant.PayloadProcessingPluginsConfigMapForTenant(namespace),
+		}, &config))
+		require.NotContains(collect, config.Data["extproc.yaml"], "filter: ai_guardrails")
+
+		filter := &unstructured.Unstructured{}
+		filter.SetAPIVersion("networking.istio.io/v1alpha3")
+		filter.SetKind("EnvoyFilter")
+		require.NoError(collect, c.Get(t.Context(), client.ObjectKey{
+			Namespace: gatewayNamespace, Name: tenant.PayloadProcessingExternalModelEnvoyFilterName(namespace),
+		}, filter))
+		patches, _, err := unstructured.NestedSlice(filter.Object, "spec", "configPatches")
+		require.NoError(collect, err)
+		require.NotEmpty(collect, patches)
+		for _, raw := range patches {
+			patch, ok := raw.(map[string]any)
+			require.True(collect, ok, "route patch = %T, want a map", raw)
+			disabled, _, nestedErr := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp", "disabled")
+			require.NoError(collect, nestedErr)
+			require.True(collect, disabled, "ExternalModel route kept the post-auth filter on for a detached guardrail")
+		}
+	}, eventuallyTimeout, pollInterval, "a detached guardrail must stop being compiled and enforced")
 }
 
 func awaitModelRemoved(t *testing.T, c client.Client, model *inferencev1alpha1.ExternalModel, routeName string) {

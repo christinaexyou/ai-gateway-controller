@@ -44,7 +44,7 @@ func TestControlPlane(t *testing.T) {
 		awaitModelRemoved(t, c, model, routeName)
 	})
 
-	t.Run("an accepted guardrail is enforced on ExternalModel routes", func(t *testing.T) {
+	t.Run("an attached guardrail is enforced on ExternalModel routes until it is detached", func(t *testing.T) {
 		const namespace = "guardrail-enforcement"
 		maas := maasFixture{client: c}
 		maas.existingPraxisTenant(t, namespace)
@@ -56,6 +56,7 @@ func TestControlPlane(t *testing.T) {
 		)
 		require.NoError(t, c.Create(t.Context(), model))
 		awaitModelPublished(t, c, model, provider)
-		awaitGuardrailEnforced(t, c, namespace)
+		attachment := awaitGuardrailEnforced(t, c, namespace)
+		awaitGuardrailDetached(t, c, namespace, attachment)
 	})
 }

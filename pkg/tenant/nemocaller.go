@@ -30,7 +30,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -52,8 +51,6 @@ const (
 	// nemoProxyPort is kube-rbac-proxy's pod port. With auth on the Service
 	// maps port 443 to it.
 	nemoProxyPort int64 = 8443
-
-	nemoChecksPath = "/v1/checks"
 )
 
 // errUncompilableCallout is returned, joined with one error per policy, when
@@ -61,8 +58,9 @@ const (
 // it are the policies that compiled; one bad policy does not drop the others.
 var errUncompilableCallout = errors.New("accepted AIGuardrail cannot be compiled")
 
-// errMalformedAttachment means one guardrails entry could not be read.
-// Entries that could be read are still used.
+// errMalformedAttachment means one guardrails entry could not be fully read.
+// The catalog fails closed for what that entry could reference; every other
+// entry is still used.
 var errMalformedAttachment = errors.New("guardrail attachment is malformed")
 
 // errStaleBinding means an accepted policy's spec changed and its status has
@@ -118,12 +116,23 @@ type nemoFilter struct {
 	closed   bool
 }
 
-// acceptedNemoCallouts returns this tenant's checks, in catalog order.
-// A policy whose accepted status is behind its spec fails the call: publishing
-// would drop checks that are still selected. Every other policy that is not a
-// current call — refused, deleting, or accepted but impossible to call — is
-// returned as a closed check, so a request that selects it is rejected.
+// acceptedNemoCallouts returns the checks this tenant's attachments select, in
+// catalog order. A policy no attachment references is ignored, and only the
+// checks an attachment selects are returned.
+// An attached policy whose accepted status is behind its spec fails the call:
+// publishing would drop checks that are still selected. Every other attached
+// policy that is not a current call — refused, deleting, or accepted but
+// impossible to call — is returned as a closed check, so a request that
+// selects it is rejected.
 func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string) ([]nemoCallout, error) {
+	refs, attachErr := catalogAttachments(ctx, reader, tenantNamespace)
+	if attachErr != nil && !errors.Is(attachErr, errMalformedAttachment) {
+		return nil, attachErr
+	}
+	attached, all := attachedPolicies(refs, tenantNamespace)
+	if !all && len(attached) == 0 {
+		return nil, attachErr
+	}
 	var policies aigatewayv1alpha1.AIGuardrailList
 	if err := reader.List(ctx, &policies, client.InNamespace(tenantNamespace)); err != nil {
 		return nil, fmt.Errorf("list AIGuardrails in %s: %w", tenantNamespace, err)
@@ -132,6 +141,9 @@ func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNames
 	var rejected []error
 	for i := range policies.Items {
 		policy := &policies.Items[i]
+		if !all && !attached[policy.Name] {
+			continue
+		}
 		if guardrail.BindingStale(policy) {
 			return nil, fmt.Errorf("%w: AIGuardrail %s/%s", errStaleBinding, policy.Namespace, policy.Name)
 		}
@@ -157,13 +169,10 @@ func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNames
 		}
 		callouts = append(callouts, callout)
 	}
-	ordered, err := orderNemoCallouts(ctx, reader, tenantNamespace, callouts)
-	if err != nil && !errors.Is(err, errMalformedAttachment) {
-		return nil, err
-	}
+	ordered := applyAttachmentOrder(callouts, refs, tenantNamespace)
 	var soft []error
-	if err != nil {
-		soft = append(soft, err)
+	if attachErr != nil {
+		soft = append(soft, attachErr)
 	}
 	if len(rejected) > 0 {
 		soft = append(soft, fmt.Errorf("%w: %w", errUncompilableCallout, errors.Join(rejected...)))
@@ -180,11 +189,11 @@ func softCalloutErr(err error) bool {
 	return errors.Is(err, errUncompilableCallout) || errors.Is(err, errMalformedAttachment)
 }
 
-// HasNemoCallouts reports whether ExternalModel routes should leave the
-// post-auth filter enabled. A stale acceptance still counts: that check is
-// in effect, and failing the model reconcile would mark the model failed for
-// a status lag. The tenant reconcile is what waits to publish.
-func HasNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string) (bool, error) {
+// hasNemoCallouts reports whether the tenant has NeMo checks compiled into
+// its post-auth config. A stale acceptance still counts - that check is in
+// effect, and failing the model reconcile would mark the model failed for a
+// status lag. The tenant reconcile is what waits to publish.
+func hasNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string) (bool, error) {
 	callouts, err := acceptedNemoCallouts(ctx, reader, tenantNamespace)
 	if errors.Is(err, errStaleBinding) {
 		return true, nil
@@ -214,9 +223,9 @@ func calloutInputs(policy *aigatewayv1alpha1.AIGuardrail) nemoCalloutInputs {
 	}
 }
 
-// NemoCalloutChanged drops AIGuardrail updates that cannot change the
+// nemoCalloutChanged drops AIGuardrail updates that cannot change the
 // compiled callouts, such as condition timestamps and finalizer patches.
-func NemoCalloutChanged() predicate.Funcs {
+func nemoCalloutChanged() predicate.Funcs {
 	return predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
 		before, okBefore := e.ObjectOld.(*aigatewayv1alpha1.AIGuardrail)
 		after, okAfter := e.ObjectNew.(*aigatewayv1alpha1.AIGuardrail)
@@ -236,16 +245,16 @@ func nemoCalloutFrom(policy *aigatewayv1alpha1.AIGuardrail) (nemoCallout, error)
 	if providerNamespace == "" {
 		providerNamespace = policy.Namespace
 	}
-	namespace, serviceName, authenticated, err := nemoServiceNamespace(policy.Status.ProviderEndpoint, providerNamespace, ref.Name)
+	service, err := guardrail.ParseNemoEndpoint(policy.Status.ProviderEndpoint, providerNamespace, ref.Name)
 	if err != nil {
-		return nemoCallout{}, err
+		return nemoCallout{}, fmt.Errorf("AIGuardrail %s/%s provider endpoint: %w", policy.Namespace, policy.Name, err)
 	}
 	callout := nemoCallout{
 		name:             policy.Name,
 		endpoint:         policy.Status.ProviderEndpoint,
-		serviceName:      serviceName,
-		serviceNamespace: namespace,
-		authenticated:    authenticated,
+		serviceName:      service.Name,
+		serviceNamespace: service.Namespace,
+		authenticated:    service.Authenticated,
 		timeout:          policy.Spec.Provider.Timeout.Duration,
 	}
 	for _, check := range policy.Spec.Checks {
@@ -329,62 +338,6 @@ func bindNemoPodSelectors(ctx context.Context, reader client.Reader, callouts []
 	}
 }
 
-// nemoServiceNamespace returns the namespace and name of the Service that
-// endpoint addresses, and whether that Service is the authenticated one.
-// http on port 80 is the auth-off Service; https on port 443 is
-// kube-rbac-proxy. Anything else is refused: the egress rule opened for the
-// callout is scoped to that namespace.
-//
-// Two host shapes are accepted. TrustyAI's published status.endpoint is
-// <name>.<namespace>.svc. When that field is empty, discovery uses the
-// Service TrustyAI creates for a workload in another namespace:
-// <custom-resource namespace>-<custom-resource name>.<workloadNamespace>.svc.
-func nemoServiceNamespace(endpoint, providerNamespace, providerName string) (string, string, bool, error) {
-	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
-		return "", "", false, fmt.Errorf("provider endpoint %q is not a plain base URL", endpoint)
-	}
-	var authenticated bool
-	switch parsed.Scheme {
-	case "http":
-		if port := parsed.Port(); port != "" && port != "80" {
-			return "", "", false, fmt.Errorf("provider endpoint %q must use the Service's port 80", endpoint)
-		}
-	case "https":
-		if port := parsed.Port(); port != "" && port != "443" {
-			return "", "", false, fmt.Errorf("provider endpoint %q must use the Service's port 443", endpoint)
-		}
-		authenticated = true
-	default:
-		return "", "", false, fmt.Errorf("provider endpoint %q must be http or https", endpoint)
-	}
-	switch strings.TrimSuffix(parsed.Path, "/") {
-	case "", nemoChecksPath:
-	default:
-		return "", "", false, fmt.Errorf("provider endpoint %q must be the NeMo base URL", endpoint)
-	}
-	// The provider name is a DNS subdomain, so it may contain dots. Cutting the
-	// host at the first dot would treat "my.rails.infra.svc" as service "my".
-	// The cross-namespace Service name is checked first so a host that starts
-	// with that longer name is not read as the shorter <name>.<namespace> form.
-	host := strings.TrimSuffix(parsed.Hostname(), ".cluster.local")
-	serviceName := providerNamespace + "-" + providerName
-	var namespace, svc string
-	switch {
-	case providerNamespace != "" && strings.HasPrefix(host, serviceName+"."):
-		namespace, svc, _ = strings.Cut(strings.TrimPrefix(host, serviceName+"."), ".")
-	case strings.HasPrefix(host, providerName+"."):
-		serviceName = providerName
-		namespace, svc, _ = strings.Cut(strings.TrimPrefix(host, providerName+"."), ".")
-	default:
-		serviceName = ""
-	}
-	if serviceName == "" || svc != "svc" || len(validation.IsDNS1123Label(namespace)) > 0 {
-		return "", "", false, fmt.Errorf("provider endpoint %q is not the in-cluster Service of NemoGuardrails %q", endpoint, providerName)
-	}
-	return namespace, serviceName, authenticated, nil
-}
-
 // checksEndpoint is the NeMo checks URL Praxis posts to. status.providerEndpoint
 // is the server base URL; a value that already ends at /v1/checks is kept.
 func checksEndpoint(endpoint string) (string, error) {
@@ -392,7 +345,7 @@ func checksEndpoint(endpoint string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	parsed.Path = nemoChecksPath
+	parsed.Path = guardrail.NemoChecksPath
 	parsed.RawPath = ""
 	return parsed.String(), nil
 }

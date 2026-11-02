@@ -36,8 +36,9 @@ import (
 )
 
 // TestEnableExternalModelRoutesKeepsPostAuthForCompiledChecks pins that a
-// tenant with a compiled NeMo check keeps the shared post-auth filter on its
-// ExternalModel routes, so those requests are checked too.
+// tenant with an attached NeMo check keeps the shared post-auth filter on its
+// ExternalModel routes, so those requests are checked too, and that an
+// unattached policy leaves it off.
 func TestEnableExternalModelRoutesKeepsPostAuthForCompiledChecks(t *testing.T) {
 	policy := &aigatewayv1alpha1.AIGuardrail{
 		ObjectMeta: metav1.ObjectMeta{Name: "safety", Namespace: "tenant-a", Generation: 1},
@@ -57,28 +58,45 @@ func TestEnableExternalModelRoutesKeepsPostAuthForCompiledChecks(t *testing.T) {
 			}},
 		},
 	}
-	r := controllerTestClient(t, policy)
-	var applied unstructured.Unstructured
-	r.ApplyResource = func(_ context.Context, _ client.Client, object unstructured.Unstructured) error {
-		applied = *object.DeepCopy()
-		return nil
-	}
-	routes := []resolver.Route{{Model: "demo-model", ClientName: "demo", Provider: "provider-a"}}
-	if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
-		t.Fatal(err)
-	}
-	patches := nestedSlice(t, applied.Object, "spec", "configPatches")
-	if len(patches) == 0 {
-		t.Fatal("no route patches were written")
-	}
-	for _, raw := range patches {
-		patch, _ := raw.(map[string]any)
-		if _, found, _ := unstructured.NestedMap(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp"); found {
-			t.Fatalf("route patch %v disables the post-auth checks filter", patch["match"])
-		}
-		if disabled, _, _ := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp-pre", "disabled"); !disabled {
-			t.Fatalf("route patch %v left the shared pre-auth filter on", patch["match"])
-		}
+	mtc := tenant.NewMaasTenantConfig()
+	mtc.SetName(tenant.MaasTenantConfigInstanceName)
+	mtc.SetNamespace("tenant-a")
+	mtc.Object["spec"] = map[string]any{"guardrails": []any{map[string]any{"ref": map[string]any{"name": "safety"}}}}
+
+	for _, c := range []struct {
+		name     string
+		objects  []client.Object
+		postAuth bool
+	}{
+		{name: "attached", objects: []client.Object{policy, mtc}, postAuth: true},
+		{name: "not attached", objects: []client.Object{policy}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := controllerTestClient(t, c.objects...)
+			var applied unstructured.Unstructured
+			r.ApplyResource = func(_ context.Context, _ client.Client, object unstructured.Unstructured) error {
+				applied = *object.DeepCopy()
+				return nil
+			}
+			routes := []resolver.Route{{Model: "demo-model", ClientName: "demo", Provider: "provider-a"}}
+			if err := r.enableExternalModelRoutes(context.Background(), "tenant-a", "tenant-a", "test-gateway", "gateway-system", routes); err != nil {
+				t.Fatal(err)
+			}
+			patches := nestedSlice(t, applied.Object, "spec", "configPatches")
+			if len(patches) == 0 {
+				t.Fatal("no route patches were written")
+			}
+			for _, raw := range patches {
+				patch, _ := raw.(map[string]any)
+				disabled, _, _ := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp", "disabled")
+				if disabled == c.postAuth {
+					t.Fatalf("route patch %v post-auth filter disabled = %v, want %v", patch["match"], disabled, !c.postAuth)
+				}
+				if disabled, _, _ := unstructured.NestedBool(patch, "patch", "value", "typed_per_filter_config", "envoy.filters.http.ext_proc.ipp-pre", "disabled"); !disabled {
+					t.Fatalf("route patch %v left the shared pre-auth filter on", patch["match"])
+				}
+			}
+		})
 	}
 }
 
@@ -1039,7 +1057,7 @@ func TestAIGuardrailEventsEnqueueTenantAndGatewayAttachedModels(t *testing.T) {
 		client.ObjectKeyFromObject(tenantModel):   true,
 		client.ObjectKeyFromObject(attachedModel): true,
 	}
-	got := r.aiguardrailModels(context.Background(), guardrail)
+	got := r.postAuthFilterModels(context.Background(), guardrail.Namespace)
 	if len(got) != len(want) {
 		t.Fatalf("AIGuardrail event enqueued %#v, want %#v", got, want)
 	}
@@ -1061,7 +1079,7 @@ func TestDefaultTenantAIGuardrailEventsEnqueueImplicitModels(t *testing.T) {
 	mtc := controllerMaasTenantConfig("models-as-a-service", tenant.DefaultAITenantName, "models-as-a-service", "praxis")
 	r := controllerTestClient(t, implicitModel, guardrail, defaultTenant, mtc)
 
-	got := r.aiguardrailModels(context.Background(), guardrail)
+	got := r.postAuthFilterModels(context.Background(), guardrail.Namespace)
 	want := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(implicitModel)}
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("default tenant AIGuardrail event enqueued %#v, want %#v", got, want)

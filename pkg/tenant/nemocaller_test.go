@@ -22,6 +22,8 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/yaml"
@@ -270,27 +273,6 @@ func TestBindNemoPodSelectorsCopiesServiceSelector(t *testing.T) {
 	}
 }
 
-func TestNemoServiceNamespaceAllowsDottedProviderName(t *testing.T) {
-	namespace, serviceName, authenticated, err := nemoServiceNamespace("http://my.rails.infra.svc.cluster.local", "team", "my.rails")
-	if err != nil || namespace != "infra" || serviceName != "my.rails" || authenticated {
-		t.Fatalf("namespace = %q, service = %q, authenticated = %t, err = %v, want infra/my.rails over http", namespace, serviceName, authenticated, err)
-	}
-	namespace, serviceName, authenticated, err = nemoServiceNamespace("https://my.rails.infra.svc.cluster.local", "team", "my.rails")
-	if err != nil || namespace != "infra" || serviceName != "my.rails" || !authenticated {
-		t.Fatalf("namespace = %q, service = %q, authenticated = %t, err = %v, want infra/my.rails over https", namespace, serviceName, authenticated, err)
-	}
-	namespace, serviceName, authenticated, err = nemoServiceNamespace("http://team-my.rails.infra.svc.cluster.local", "team", "my.rails")
-	if err != nil || namespace != "infra" || serviceName != "team-my.rails" || authenticated {
-		t.Fatalf("namespace = %q, service = %q, authenticated = %t, err = %v, want the cross-namespace Service", namespace, serviceName, authenticated, err)
-	}
-	if _, _, _, err := nemoServiceNamespace("http://my.other.infra.svc.cluster.local", "team", "my.rails"); err == nil {
-		t.Fatal("accepted a Service whose name is only a prefix of the provider")
-	}
-	if _, _, _, err := nemoServiceNamespace("https://my.rails.infra.svc:8443", "team", "my.rails"); err == nil {
-		t.Fatal("accepted an https Service that is not on port 443")
-	}
-}
-
 func TestAcceptedNemoCalloutsUsesCrossNamespaceServiceName(t *testing.T) {
 	policy := acceptedPolicy("safety", 3, 3, "http://tenant-a-nemo.odh-ai-gateway-infra.svc.cluster.local")
 	callouts, err := calloutsFor(t, policy)
@@ -346,7 +328,7 @@ func TestNemoCalloutChangedIgnoresConditionChurn(t *testing.T) {
 	after.Status.Conditions[0].LastTransitionTime = metav1.Now()
 	after.Status.Conditions = append(after.Status.Conditions, metav1.Condition{Type: guardrail.ConditionProviderReady, Status: metav1.ConditionTrue})
 	after.Finalizers = []string{"x"}
-	if NemoCalloutChanged().Update(event.UpdateEvent{ObjectOld: before, ObjectNew: after}) {
+	if nemoCalloutChanged().Update(event.UpdateEvent{ObjectOld: before, ObjectNew: after}) {
 		t.Fatal("a condition timestamp or finalizer change requeued the tenant")
 	}
 	for name, mutate := range map[string]func(*aigatewayv1alpha1.AIGuardrail){
@@ -358,7 +340,7 @@ func TestNemoCalloutChangedIgnoresConditionChurn(t *testing.T) {
 	} {
 		changed := before.DeepCopy()
 		mutate(changed)
-		if !NemoCalloutChanged().Update(event.UpdateEvent{ObjectOld: before, ObjectNew: changed}) {
+		if !nemoCalloutChanged().Update(event.UpdateEvent{ObjectOld: before, ObjectNew: changed}) {
 			t.Errorf("%s change did not requeue the tenant", name)
 		}
 	}
@@ -427,13 +409,13 @@ func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
 	}
 
 	stale := acceptedPolicy("stale", 4, 3, "http://nemo.infra.svc.cluster.local")
-	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(current, stale).Build()
+	reader := attachedReader(current, stale)
 	_, err = acceptedNemoCallouts(context.Background(), reader, "tenant-a")
 	if !errors.Is(err, errStaleBinding) {
 		t.Fatalf("acceptedNemoCallouts error = %v, want the stale policy to block publishing", err)
 	}
-	if has, err := HasNemoCallouts(context.Background(), reader, "tenant-a"); err != nil || !has {
-		t.Fatalf("HasNemoCallouts = %v, %v; want the post-auth filter kept on while status catches up", has, err)
+	if has, err := hasNemoCallouts(context.Background(), reader, "tenant-a"); err != nil || !has {
+		t.Fatalf("hasNemoCallouts = %v, %v; want the post-auth filter kept on while status catches up", has, err)
 	}
 }
 
@@ -452,9 +434,8 @@ func TestAcceptedNemoCalloutsUseCheckSelectionHeader(t *testing.T) {
 	if got, want := callouts[0].checks[0].header, guardrail.CheckHeaderName("tenant-a", "safety", "pii"); got != want {
 		t.Fatalf("header = %q, want %q", got, want)
 	}
-	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy).Build()
-	if has, err := HasNemoCallouts(context.Background(), reader, "tenant-a"); err != nil || !has {
-		t.Fatalf("HasNemoCallouts = %v, %v; want true", has, err)
+	if has, err := hasNemoCallouts(context.Background(), attachedReader(policy), "tenant-a"); err != nil || !has {
+		t.Fatalf("hasNemoCallouts = %v, %v; want true", has, err)
 	}
 }
 
@@ -572,25 +553,99 @@ func parseCompiled(t *testing.T, config string) (map[string]any, []any) {
 	return doc, filters
 }
 
+// calloutsFor compiles the policies with each one attached, in name order,
+// through the tenant config.
 func calloutsFor(t *testing.T, policies ...*aigatewayv1alpha1.AIGuardrail) ([]nemoCallout, error) {
 	t.Helper()
-	builder := fake.NewClientBuilder().WithScheme(mtcSchemeForTests())
-	for _, policy := range policies {
-		builder = builder.WithObjects(policy)
-	}
-	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), attachedReader(policies...), "tenant-a")
 	if err != nil && !softCalloutErr(err) {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
 	return callouts, err
 }
 
+// attachedReader serves the policies and a tenant config that attaches every
+// one of them, in name order.
+//
+//nolint:ireturn // controller-runtime's fake client is only exposed as an interface.
+func attachedReader(policies ...*aigatewayv1alpha1.AIGuardrail) client.Reader {
+	names := make([]string, 0, len(policies))
+	builder := fake.NewClientBuilder().WithScheme(mtcSchemeForTests())
+	for _, policy := range policies {
+		names = append(names, policy.Name)
+		builder = builder.WithObjects(policy)
+	}
+	sort.Strings(names)
+	entries := make([]any, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, map[string]any{"ref": map[string]any{"name": name}})
+	}
+	return builder.WithObjects(tenantConfigWithGuardrails(entries)).Build()
+}
+
+func tenantConfigWithGuardrails(entries []any) *unstructured.Unstructured {
+	mtc := NewMaasTenantConfig()
+	mtc.SetName(MaasTenantConfigInstanceName)
+	mtc.SetNamespace("tenant-a")
+	spec := map[string]any{}
+	if entries != nil {
+		spec["guardrails"] = entries
+	}
+	mtc.Object["spec"] = spec
+	return mtc
+}
+
+// TestCatalogCompilesOnlyAttachedChecks pins the AITenant attachment contract:
+// a non-empty checks list selects only the named checks, and a policy applies
+// only while something attaches it.
+func TestCatalogCompilesOnlyAttachedChecks(t *testing.T) {
+	policy := acceptedPolicy("safety", 3, 3, "http://nemo.infra.svc")
+	policy.Spec.Checks = []aigatewayv1alpha1.AIGuardrailCheck{
+		{Name: "pii", ConfigID: "pii-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
+		{Name: "jail", ConfigID: "jail-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
+	}
+	unattached := acceptedPolicy("unattached", 3, 3, "http://nemo.infra.svc")
+	refused := acceptedPolicy("refused", 3, 3, "http://nemo.infra.svc")
+	refused.Status.Conditions[0].Status = metav1.ConditionFalse
+	stale := acceptedPolicy("stale", 4, 3, "http://nemo.infra.svc")
+	ait := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{"guardrails": []any{
+			map[string]any{"ref": map[string]any{"name": "safety"}, "checks": []any{"pii"}},
+		}},
+		"status": map[string]any{"tenantNamespace": "tenant-a"},
+	}}
+	ait.SetGroupVersionKind(AITenantGVK)
+	ait.SetName("red")
+	ait.SetNamespace("ai-tenants")
+	mtc := tenantConfigWithGuardrails(nil)
+	mtc.SetAnnotations(map[string]string{AnnotationAITenantName: "red", AnnotationAITenantNamespace: "ai-tenants"})
+
+	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, refused, stale, ait, mtc).Build()
+	callouts, err := acceptedNemoCallouts(context.Background(), reader, "tenant-a")
+	if err != nil {
+		t.Fatalf("acceptedNemoCallouts: %v; an unattached stale policy must not block publishing", err)
+	}
+	if len(callouts) != 1 || callouts[0].name != "safety" || callouts[0].closed || len(callouts[0].checks) != 1 || callouts[0].checks[0].name != "pii" {
+		t.Fatalf("callouts = %#v, want only safety/pii; jail is not selected and the others are not attached", callouts)
+	}
+
+	detached := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, mtc).Build()
+	callouts, err = acceptedNemoCallouts(context.Background(), detached, "tenant-a")
+	if err != nil || len(callouts) != 0 {
+		t.Fatalf("callouts = %#v, err = %v; want none once the last attachment is removed", callouts, err)
+	}
+	if has, err := HasPostAuthFilters(context.Background(), detached, "tenant-a"); err != nil || has {
+		t.Fatalf("HasPostAuthFilters = %v, %v; want false with nothing attached", has, err)
+	}
+}
+
 // TestCatalogFollowsGuardrailArrays checks that broader lists run before narrower
 // ones, and that each list keeps the order it was written. Two subscriptions are
 // ordered by name (aaa, then team). Two model refs are ordered by namespace
 // (models/granite, then tenant-a/qwen), and the subscription's own model entry
-// comes after those. A check named twice runs the first time. A policy nobody
-// named goes last.
+// comes after those. A check named twice runs the first time. A scope that
+// selects some of a policy's checks compiles only those, and a tenant policy
+// nobody attaches is not compiled.
 func TestCatalogFollowsGuardrailArrays(t *testing.T) {
 	endpoint := "http://nemo.infra.svc"
 	zebra := acceptedPolicy("zebra", 3, 3, endpoint)
@@ -608,7 +663,14 @@ func TestCatalogFollowsGuardrailArrays(t *testing.T) {
 		acceptedPolicy("remote-policy", 3, 3, endpoint),
 		acceptedPolicy("entry-policy", 3, 3, endpoint),
 		acceptedPolicy("loose", 3, 3, endpoint),
+		acceptedPolicy("unattached", 3, 3, endpoint),
 	}
+	subset := acceptedPolicy("subset", 3, 3, endpoint)
+	subset.Spec.Checks = []aigatewayv1alpha1.AIGuardrailCheck{
+		{Name: "pii", ConfigID: "pii-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
+		{Name: "jail", ConfigID: "jail-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
+	}
+	policies = append(policies, subset)
 	shared := acceptedPolicy("shared", 3, 3, endpoint)
 	shared.Spec.Checks = []aigatewayv1alpha1.AIGuardrailCheck{
 		{Name: "b", ConfigID: "b-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
@@ -654,6 +716,7 @@ func TestCatalogFollowsGuardrailArrays(t *testing.T) {
 	})
 	aaa := subscriptionWithGuardrails("aaa", []any{
 		map[string]any{"ref": map[string]any{"name": "late-name"}},
+		map[string]any{"ref": map[string]any{"name": "subset"}, "checks": []any{"pii"}},
 	}, nil)
 	model := &unstructured.Unstructured{Object: map[string]any{
 		"spec": map[string]any{"guardrails": []any{
@@ -696,19 +759,102 @@ func TestCatalogFollowsGuardrailArrays(t *testing.T) {
 		{"shared", "a"},
 		{"middle", "pii"},
 		{"late-name", "pii"},
+		{"subset", "pii"},
 		{"early", "pii"}, {"shared", "b"},
 		{"remote-policy", "pii"},
 		{"model-policy", "pii"},
 		{"entry-policy", "pii"},
-		{"loose", "pii"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("checks = %v, want %v", got, want)
+	}
+	for _, check := range got {
+		switch {
+		case check == placed{"subset", "jail"}:
+			t.Fatalf("checks = %v; subset/jail compiled though its only attachment selects pii", got)
+		case check.policy == "unattached" || check.policy == "loose":
+			t.Fatalf("checks = %v; %s compiled though no tenant attachment references it", got, check.policy)
+		}
 	}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("check %d = %v, want %v\nfull = %v", i, got[i], want[i], got)
 		}
+	}
+}
+
+// TestMalformedAttachmentFailsClosed pins that a bad entry never drops a
+// policy it may reference. Unreadable checks select the whole named policy;
+// an entry with no readable policy attaches every tenant policy. Readable
+// entries keep their order and selection.
+func TestMalformedAttachmentFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	twoChecks := func(name string) *aigatewayv1alpha1.AIGuardrail {
+		policy := acceptedPolicy(name, 1, 1, "http://nemo.infra.svc")
+		policy.Spec.Checks = []aigatewayv1alpha1.AIGuardrailCheck{
+			{Name: "pii", ConfigID: "pii-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
+			{Name: "jail", ConfigID: "jail-v1", Phases: []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput}},
+		}
+		return policy
+	}
+	selected := func(callouts []nemoCallout) []string {
+		var got []string
+		for _, callout := range callouts {
+			for _, check := range callout.checks {
+				got = append(got, callout.name+"/"+check.name)
+			}
+		}
+		return got
+	}
+	mtcWith := func(guardrails any) *unstructured.Unstructured {
+		mtc := NewMaasTenantConfig()
+		mtc.SetName(MaasTenantConfigInstanceName)
+		mtc.SetNamespace("tenant-a")
+		mtc.Object["spec"] = map[string]any{"guardrails": guardrails}
+		return mtc
+	}
+
+	cases := []struct {
+		name       string
+		guardrails any
+		want       []string
+	}{
+		{
+			name: "unreadable checks select the whole named policy",
+			guardrails: []any{
+				map[string]any{"ref": map[string]any{"name": "named"}, "checks": "pii"},
+			},
+			want: []string{"named/pii", "named/jail"},
+		},
+		{
+			name: "an entry with no policy attaches every tenant policy after the readable ones",
+			guardrails: []any{
+				map[string]any{"ref": map[string]any{"name": "named"}, "checks": []any{"pii"}},
+				map[string]any{"ref": map[string]any{}},
+			},
+			want: []string{"named/pii", "named/jail", "other/pii", "other/jail"},
+		},
+		{
+			name:       "a list that is not a list attaches every tenant policy",
+			guardrails: "not-a-list",
+			want:       []string{"named/pii", "named/jail", "other/pii", "other/jail"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
+				WithObjects(twoChecks("named"), twoChecks("other"), mtcWith(tc.guardrails)).Build()
+			callouts, err := acceptedNemoCallouts(ctx, reader, "tenant-a")
+			if !errors.Is(err, errMalformedAttachment) || !softCalloutErr(err) {
+				t.Fatalf("acceptedNemoCallouts error = %v, want a soft malformed attachment", err)
+			}
+			if got := selected(callouts); !slices.Equal(got, tc.want) {
+				t.Fatalf("checks = %v, want %v", got, tc.want)
+			}
+			if has, err := hasNemoCallouts(ctx, reader, "tenant-a"); err != nil || !has {
+				t.Fatalf("hasNemoCallouts = %v, %v; want the post-auth filter on", has, err)
+			}
+		})
 	}
 }
 
