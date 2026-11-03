@@ -123,8 +123,10 @@ type nemoFilter struct {
 // publishing would drop checks that are still selected. Every other attached
 // policy that is not a current call — refused, deleting, or accepted but
 // impossible to call — is returned as a closed check, so a request that
-// selects it is rejected.
-func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string) ([]nemoCallout, error) {
+// selects it is rejected. With outputUnsupported, a policy with an Output
+// check is also closed rather than compiled with a response hook that would
+// not run; see OutputChecksUnsupported.
+func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string, outputUnsupported bool) ([]nemoCallout, error) {
 	refs, attachErr := catalogAttachments(ctx, reader, tenantNamespace)
 	if attachErr != nil && !errors.Is(attachErr, errMalformedAttachment) {
 		return nil, attachErr
@@ -160,6 +162,9 @@ func acceptedNemoCallouts(ctx context.Context, reader client.Reader, tenantNames
 			continue
 		}
 		callout, err := nemoCalloutFrom(policy)
+		if err == nil && outputUnsupported && slices.ContainsFunc(callout.checks, func(c nemoCheck) bool { return c.response }) {
+			err = fmt.Errorf("AIGuardrail %s/%s has Output checks, which this tenant cannot enforce", policy.Namespace, policy.Name)
+		}
 		if err != nil {
 			rejected = append(rejected, err)
 			if closed, ok := closedCallout(policy); ok {
@@ -192,9 +197,10 @@ func softCalloutErr(err error) bool {
 // hasNemoCallouts reports whether the tenant has NeMo checks compiled into
 // its post-auth config. A stale acceptance still counts - that check is in
 // effect, and failing the model reconcile would mark the model failed for a
-// status lag. The tenant reconcile is what waits to publish.
+// status lag. The tenant reconcile is what waits to publish. A closed check
+// counts like a compiled one, so the Output gate cannot change the answer.
 func hasNemoCallouts(ctx context.Context, reader client.Reader, tenantNamespace string) (bool, error) {
-	callouts, err := acceptedNemoCallouts(ctx, reader, tenantNamespace)
+	callouts, err := acceptedNemoCallouts(ctx, reader, tenantNamespace, false)
 	if errors.Is(err, errStaleBinding) {
 		return true, nil
 	}

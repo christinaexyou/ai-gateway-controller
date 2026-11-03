@@ -134,6 +134,14 @@ func TestEvaluateNemoReadyGatesOnTheDiscoveredEndpoint(t *testing.T) {
 			wantEndpoint: "http://" + providerNS + "-" + nemoName + ".nemo-workloads.svc.cluster.local",
 		},
 		{
+			name:     "endpoint outside the published workload namespace",
+			provider: withStatus(map[string]any{"endpoint": nemoEndpoint, "workloadNamespace": "nemo-workloads"}),
+		},
+		{
+			name:     "workload in the custom resource namespace, no endpoint",
+			provider: withStatus(map[string]any{"workloadNamespace": providerNS}),
+		},
+		{
 			name:     "invalid workload namespace",
 			provider: withStatus(map[string]any{"workloadNamespace": "evil.example.com#"}),
 		},

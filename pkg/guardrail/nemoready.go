@@ -77,7 +77,10 @@ type nemoReadiness struct {
 // publishes once the workload is ready. The Service name is the custom
 // resource namespace and name joined with a hyphen, which is how TrustyAI
 // names the Service when the workload runs in another namespace:
-// <namespace>-<name>.<workloadNamespace>.svc.cluster.local.
+// <namespace>-<name>.<workloadNamespace>.svc.cluster.local. A workload in the
+// custom resource's own namespace is not discovered this way, since TrustyAI
+// names that Service differently. Once the workload namespace is published, a
+// Service in any other namespace is not discovered.
 //
 // The value is parsed rather than trusted. status.endpoint is owned by another
 // controller, and ParseNemoEndpoint is the same rule the tenant compiler uses,
@@ -93,9 +96,17 @@ func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
 		return undiscovered
 	}
 
+	workloadNamespace, _, _ := unstructured.NestedString(nemo.Object, "status", "workloadNamespace")
 	discovered, found, err := unstructured.NestedString(nemo.Object, "status", "endpoint")
 	if err != nil || !found || discovered == "" {
-		if endpoint, ok := nemoServiceEndpoint(nemo); ok {
+		if workloadNamespace != "" && workloadNamespace == nemo.GetNamespace() {
+			return nemoReadiness{
+				Reason: reasonEndpointDiscoveryUnavailable,
+				Message: "the referenced NemoGuardrails provider runs its workload in its own namespace, where its " +
+					"Service name is not derived, so no supported checks endpoint could be discovered",
+			}
+		}
+		if endpoint, ok := nemoServiceEndpoint(nemo, workloadNamespace); ok {
 			return nemoReadiness{
 				Ready:    true,
 				Endpoint: endpoint,
@@ -116,6 +127,14 @@ func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
 					"in-cluster Service URL (%v), so no supported checks endpoint could be discovered", err),
 		}
 	}
+	if workloadNamespace != "" && service.Namespace != workloadNamespace {
+		return nemoReadiness{
+			Reason: reasonEndpointDiscoveryUnavailable,
+			Message: fmt.Sprintf(
+				"the referenced NemoGuardrails provider's Service is in namespace %q, not its workload namespace %q, "+
+					"so no supported checks endpoint could be discovered", service.Namespace, workloadNamespace),
+		}
+	}
 
 	message := "referenced NemoGuardrails provider publishes an in-cluster http checks endpoint; " +
 		"this confirms discovery, not that the server is serving"
@@ -133,11 +152,10 @@ func evaluateNemoReady(nemo *unstructured.Unstructured) nemoReadiness {
 
 // nemoServiceEndpoint returns the server's in-cluster http Service URL once
 // status.workloadNamespace is published.
-func nemoServiceEndpoint(nemo *unstructured.Unstructured) (string, bool) {
-	workloadNamespace, _, err := unstructured.NestedString(nemo.Object, "status", "workloadNamespace")
+func nemoServiceEndpoint(nemo *unstructured.Unstructured, workloadNamespace string) (string, bool) {
 	name := nemo.GetName()
 	namespace := nemo.GetNamespace()
-	if err != nil || workloadNamespace == "" || name == "" || namespace == "" {
+	if workloadNamespace == "" || name == "" || namespace == "" {
 		return "", false
 	}
 	if errs := validation.IsDNS1123Label(workloadNamespace); len(errs) > 0 {

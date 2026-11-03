@@ -410,7 +410,7 @@ func TestAcceptedNemoCalloutsSkipsStalePolicy(t *testing.T) {
 
 	stale := acceptedPolicy("stale", 4, 3, "http://nemo.infra.svc.cluster.local")
 	reader := attachedReader(current, stale)
-	_, err = acceptedNemoCallouts(context.Background(), reader, "tenant-a")
+	_, err = acceptedNemoCallouts(context.Background(), reader, "tenant-a", false)
 	if !errors.Is(err, errStaleBinding) {
 		t.Fatalf("acceptedNemoCallouts error = %v, want the stale policy to block publishing", err)
 	}
@@ -522,6 +522,44 @@ func TestAcceptedNemoCalloutsRejectsSubMillisecondTimeout(t *testing.T) {
 	}
 }
 
+// TestAcceptedNemoCalloutsClosesOutputChecksItCannotEnforce pins that, where the
+// tenant cannot run response checks, an accepted policy with an Output check
+// rejects its selection instead of compiling a response hook that would be
+// skipped, and that Input-only policies still compile.
+func TestTenantNemoCalloutsClosesOutputChecksItCannotEnforce(t *testing.T) {
+	input := acceptedPolicy("input", 3, 3, "http://nemo.infra.svc.cluster.local")
+	output := acceptedPolicy("output", 3, 3, "http://nemo.infra.svc.cluster.local")
+	output.Spec.Checks[0].Phases = []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput, aigatewayv1alpha1.GuardrailPhaseOutput}
+	reader := attachedReader(input, output)
+
+	callouts, err := acceptedNemoCallouts(context.Background(), reader, "tenant-a", true)
+	if !errors.Is(err, errUncompilableCallout) {
+		t.Fatalf("error = %v, want %v", err, errUncompilableCallout)
+	}
+	if len(callouts) != 2 || callouts[0].name != "input" || callouts[0].closed || callouts[1].name != "output" || !callouts[1].closed {
+		t.Fatalf("callouts = %#v, want the Input policy compiled and a closed stand-in for the Output one", callouts)
+	}
+
+	callouts, err = acceptedNemoCallouts(context.Background(), reader, "tenant-a", false)
+	if err != nil || len(callouts) != 2 || callouts[1].closed || !callouts[1].checks[0].response {
+		t.Fatalf("callouts = %#v, %v; want the Output check compiled where the tenant can enforce it", callouts, err)
+	}
+}
+
+func TestOutputChecksUnsupportedFollowsAPITranslation(t *testing.T) {
+	enabled := tenantConfigWithGuardrails(nil)
+	enabled.Object["spec"] = map[string]any{"apiTranslation": map[string]any{"enabled": true}}
+	disabled := tenantConfigWithGuardrails(nil)
+	disabled.SetNamespace("tenant-b")
+	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(enabled, disabled).Build()
+	for namespace, want := range map[string]bool{"tenant-a": true, "tenant-b": false, "not-a-tenant": false} {
+		why, err := OutputChecksUnsupported(context.Background(), reader, namespace)
+		if err != nil || (why != "") != want {
+			t.Errorf("OutputChecksUnsupported(%s) = %q, %v; want unsupported %v", namespace, why, err, want)
+		}
+	}
+}
+
 // TestAcceptedNemoCalloutsSkipsEmptyEndpoint pins that an accepted policy
 // with no providerEndpoint cannot be called. It rejects its own selection.
 // That is not a compile failure of the policies that do publish an endpoint.
@@ -556,7 +594,7 @@ func parseCompiled(t *testing.T, config string) (map[string]any, []any) {
 // through the tenant config.
 func calloutsFor(t *testing.T, policies ...*aigatewayv1alpha1.AIGuardrail) ([]nemoCallout, error) {
 	t.Helper()
-	callouts, err := acceptedNemoCallouts(context.Background(), attachedReader(policies...), "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), attachedReader(policies...), "tenant-a", false)
 	if err != nil && !softCalloutErr(err) {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
@@ -620,7 +658,7 @@ func TestCatalogCompilesOnlyAttachedChecks(t *testing.T) {
 	mtc.SetAnnotations(map[string]string{AnnotationAITenantName: "red", AnnotationAITenantNamespace: "ai-tenants"})
 
 	reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, refused, stale, ait, mtc).Build()
-	callouts, err := acceptedNemoCallouts(context.Background(), reader, "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), reader, "tenant-a", false)
 	if err != nil {
 		t.Fatalf("acceptedNemoCallouts: %v; an unattached stale policy must not block publishing", err)
 	}
@@ -629,7 +667,7 @@ func TestCatalogCompilesOnlyAttachedChecks(t *testing.T) {
 	}
 
 	detached := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, mtc).Build()
-	callouts, err = acceptedNemoCallouts(context.Background(), detached, "tenant-a")
+	callouts, err = acceptedNemoCallouts(context.Background(), detached, "tenant-a", false)
 	if err != nil || len(callouts) != 0 {
 		t.Fatalf("callouts = %#v, err = %v; want none once the last attachment is removed", callouts, err)
 	}
@@ -741,7 +779,7 @@ func TestCatalogFollowsGuardrailArrays(t *testing.T) {
 	for _, policy := range policies {
 		builder = builder.WithObjects(policy)
 	}
-	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a", false)
 	if err != nil {
 		t.Fatalf("acceptedNemoCallouts: %v", err)
 	}
@@ -843,7 +881,7 @@ func TestMalformedAttachmentFailsClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
 				WithObjects(twoChecks("named"), twoChecks("other"), mtcWith(tc.guardrails)).Build()
-			callouts, err := acceptedNemoCallouts(ctx, reader, "tenant-a")
+			callouts, err := acceptedNemoCallouts(ctx, reader, "tenant-a", false)
 			if !errors.Is(err, errMalformedAttachment) || !softCalloutErr(err) {
 				t.Fatalf("acceptedNemoCallouts error = %v, want a soft malformed attachment", err)
 			}
@@ -874,7 +912,7 @@ func TestMalformedAttachmentDoesNotDropTheCatalog(t *testing.T) {
 		}},
 	})
 	client := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, mtc, sub).Build()
-	callouts, err := acceptedNemoCallouts(context.Background(), client, "tenant-a")
+	callouts, err := acceptedNemoCallouts(context.Background(), client, "tenant-a", false)
 	if !errors.Is(err, errMalformedAttachment) {
 		t.Fatalf("acceptedNemoCallouts error = %v, want malformed attachment", err)
 	}
