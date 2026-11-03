@@ -293,32 +293,16 @@ func (r *Reconciler) maasTenantConfigForNamespace(_ context.Context, obj client.
 // A model ref in the tenant namespace updates that tenant. One stored with the model
 // updates each tenant whose subscription points at it, not a tenant config in the model namespace.
 func (r *Reconciler) enqueueMaasTenantConfigForModelRef(ctx context.Context, obj client.Object) []reconcile.Request {
-	seen := map[string]bool{}
-	var requests []reconcile.Request
-	add := func(namespace string) {
-		if namespace == "" || seen[namespace] {
-			return
-		}
-		seen[namespace] = true
+	namespaces, err := ModelRefTenants(ctx, r.Client, obj)
+	if err != nil {
+		r.Log.Error(err, "resolve tenants for MaaSModelRef watch; subscribing tenants were not enqueued")
+	}
+	requests := make([]reconcile.Request, 0, len(namespaces))
+	for _, namespace := range namespaces {
 		requests = append(requests, reconcile.Request{NamespacedName: types.NamespacedName{
 			Namespace: namespace,
 			Name:      MaasTenantConfigInstanceName,
 		}})
-	}
-	if obj.GetNamespace() != "" {
-		mtc := NewMaasTenantConfig()
-		err := r.Client.Get(ctx, client.ObjectKey{Namespace: obj.GetNamespace(), Name: MaasTenantConfigInstanceName}, mtc)
-		if err == nil || !apierrors.IsNotFound(err) {
-			add(obj.GetNamespace())
-		}
-	}
-	naming, err := subscriptionNamespacesNaming(ctx, r.Client, obj.GetNamespace(), obj.GetName())
-	if err != nil {
-		r.Log.Error(err, "list MaaSSubscriptions for MaaSModelRef watch")
-		return requests
-	}
-	for _, namespace := range naming {
-		add(namespace)
 	}
 	return requests
 }
@@ -635,7 +619,7 @@ func (r *Reconciler) reconcilePraxis(ctx context.Context, log logr.Logger, mtc *
 		labels[managedByLabel] = render.FieldOwner
 		resources[i].SetLabels(labels)
 	}
-	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace)
+	callouts, err := acceptedNemoCallouts(ctx, r.Client, tenantNamespace, apiTranslation)
 	if errors.Is(err, errStaleBinding) {
 		log.Info("guardrail status is behind its spec; keeping the checks already published", "error", err)
 		return ctrl.Result{RequeueAfter: constants.NotReadyRequeueInterval}, nil
