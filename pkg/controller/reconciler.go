@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -21,10 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -112,13 +115,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Model routes enable the post-auth filter only while the tenant has
 	// post-auth filters, so re-check them when one of those inputs changes.
 	for _, src := range tenant.PostAuthFilterSources() {
-		models = models.Watches(src.Object, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-			var requests []reconcile.Request
-			for _, namespace := range src.Tenants(ctx, r.Client, obj) {
-				requests = append(requests, r.postAuthFilterModels(ctx, namespace)...)
-			}
-			return requests
-		}), builder.WithPredicates(src.Predicate))
+		models = models.Watches(src.Object, r.postAuthFilterHandler(src), builder.WithPredicates(src.Predicate))
 	}
 	if err := models.
 		WatchesRawSource(source.Kind(mgr.GetCache(), tenant.NewMaasTenantConfig(), handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](r.maasTenantConfigModels))).
@@ -278,17 +275,77 @@ func (r *Reconciler) serviceModels(ctx context.Context, obj client.Object) []rec
 	return r.modelsInNamespace(ctx, obj.GetNamespace())
 }
 
-// postAuthFilterModels returns the models whose routes are in the tenant:
-// models in its namespace and models attached to its Gateway from other
-// namespaces.
-func (r *Reconciler) postAuthFilterModels(ctx context.Context, tenantNamespace string) []reconcile.Request {
+// postAuthFilterRetryDelays are the waits between retries when the tenant
+// lookup fails temporarily. The event won't fire again, so without retries
+// models attached to the tenant's Gateway would be missed.
+var postAuthFilterRetryDelays = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+
+// postAuthFilterHandler queues the models of each tenant affected by a
+// change. It holds the queue so it can retry later.
+//
+//nolint:ireturn // controller-runtime watches take a handler.EventHandler.
+func (r *Reconciler) postAuthFilterHandler(src tenant.PostAuthFilterSource) handler.EventHandler {
+	enqueue := func(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request], objects ...client.Object) {
+		for _, obj := range objects {
+			for _, namespace := range src.Tenants(ctx, r.Client, obj) {
+				r.enqueuePostAuthFilterModels(ctx, q, namespace, 0)
+			}
+		}
+	}
+	return handler.Funcs{
+		CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+		UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.ObjectOld, e.ObjectNew)
+		},
+		DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+		GenericFunc: func(ctx context.Context, e event.GenericEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			enqueue(ctx, q, e.Object)
+		},
+	}
+}
+
+// enqueuePostAuthFilterModels queues the tenant's models and retries if the
+// tenant lookup failed temporarily. Other failures are only logged; fixing
+// the MaasTenantConfig or AITenant triggers a new pass.
+func (r *Reconciler) enqueuePostAuthFilterModels(ctx context.Context, q workqueue.TypedRateLimitingInterface[reconcile.Request], namespace string, attempt int) {
+	if ctx.Err() != nil || q.ShuttingDown() {
+		return
+	}
+	requests, err := r.postAuthFilterModels(ctx, namespace)
+	for _, request := range requests {
+		q.Add(request)
+	}
+	if err == nil {
+		return
+	}
+	if !transientReadError(err) || attempt >= len(postAuthFilterRetryDelays) {
+		r.Log.Error(err, "resolve tenant for post-auth filter event; gateway-attached models were not enqueued",
+			"namespace", namespace, "attempts", attempt+1)
+		return
+	}
+	time.AfterFunc(postAuthFilterRetryDelays[attempt], func() {
+		r.enqueuePostAuthFilterModels(ctx, q, namespace, attempt+1)
+	})
+}
+
+// postAuthFilterModels returns the tenant's models: those in its namespace
+// and those attached to its Gateway. If the tenant lookup fails, it still
+// returns the ones in its namespace, along with the error.
+func (r *Reconciler) postAuthFilterModels(ctx context.Context, tenantNamespace string) ([]reconcile.Request, error) {
 	if !r.namespaceAllowed(tenantNamespace) {
-		return nil
+		return nil, nil
 	}
 	requests := r.modelsInNamespace(ctx, tenantNamespace)
 	resolution, err := r.resolveTenantForNamespace(ctx, tenantNamespace)
-	if err != nil || resolution.aitenant == nil {
-		return requests
+	if err != nil {
+		return requests, err
+	}
+	if resolution.aitenant == nil {
+		return requests, nil
 	}
 	seen := make(map[types.NamespacedName]struct{}, len(requests))
 	for _, request := range requests {
@@ -301,7 +358,7 @@ func (r *Reconciler) postAuthFilterModels(ctx context.Context, tenantNamespace s
 		seen[request.NamespacedName] = struct{}{}
 		requests = append(requests, request)
 	}
-	return requests
+	return requests, nil
 }
 
 func (r *Reconciler) tenantModels(ctx context.Context, ait *unstructured.Unstructured) []reconcile.Request {

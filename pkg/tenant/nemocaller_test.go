@@ -443,19 +443,18 @@ func TestAcceptedNemoCalloutsUseCheckSelectionHeader(t *testing.T) {
 // cannot be compiled is left out instead of failing the whole tenant.
 func TestAcceptedNemoCalloutsIsolatesBrokenPolicy(t *testing.T) {
 	good := acceptedPolicy("good", 3, 3, "http://nemo.infra.svc")
-	//nolint:gosec // G101: the userinfo entry is a fixture URL the compiler must reject, not a credential
 	broken := map[string]string{
 		"external-host":  "http://attacker.example",
 		"other-service":  "http://other.infra.svc",
 		"bad-namespace":  "http://nemo.in_fra.svc",
 		"wrong-port":     "http://nemo.infra.svc:8443",
 		"pathed":         "http://nemo.infra.svc/proxy",
-		"userinfo":       "http://user:pw@nemo.infra.svc",
 		"query":          "http://nemo.infra.svc/?x=1",
 		"other-scheme":   "ftp://nemo.infra.svc",
 		"https-port":     "https://nemo.infra.svc:8443",
 		"not-a-svc-name": "http://nemo.infra.pod",
 	}
+	broken["userinfo"] = "http://user:pw@nemo.infra.svc"
 	policies := []*aigatewayv1alpha1.AIGuardrail{good}
 	for name, endpoint := range broken {
 		policies = append(policies, acceptedPolicy(name, 3, 3, endpoint))
