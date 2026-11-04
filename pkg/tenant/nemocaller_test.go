@@ -666,7 +666,12 @@ func TestCatalogCompilesOnlyAttachedChecks(t *testing.T) {
 		t.Fatalf("callouts = %#v, want only safety/pii; jail is not selected and the others are not attached", callouts)
 	}
 
-	detached := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, mtc).Build()
+	// The AITenant stays and drops its list: the attachment is what goes
+	// away. An owner that is named but missing is a baseline that cannot be
+	// read, and that attaches every policy rather than none.
+	emptied := ait.DeepCopy()
+	unstructured.RemoveNestedField(emptied.Object, "spec", "guardrails")
+	detached := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(policy, unattached, emptied, mtc).Build()
 	callouts, err = acceptedNemoCallouts(context.Background(), detached, "tenant-a", false)
 	if err != nil || len(callouts) != 0 {
 		t.Fatalf("callouts = %#v, err = %v; want none once the last attachment is removed", callouts, err)
@@ -919,6 +924,233 @@ func TestMalformedAttachmentDoesNotDropTheCatalog(t *testing.T) {
 	if len(callouts) != 1 || callouts[0].name != "ok" || len(callouts[0].checks) != 1 {
 		t.Fatalf("callouts = %+v, want the readable ok/pii attachment", callouts)
 	}
+}
+
+// TestBaselineSurvivesANarrowerAttachment pins that a narrower list cannot
+// shrink the baseline. The subscription re-attaches the baseline policy
+// asking for one of its checks; the baseline already took both, so the
+// subscription's entry contributes nothing and jail still runs.
+func TestBaselineSurvivesANarrowerAttachment(t *testing.T) {
+	endpoint := "http://nemo.infra.svc"
+	safety := policyWithChecks("safety", endpoint, "pii", "jail")
+	aitenant, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+	team := subscriptionWithGuardrails("team", []any{attachEntry("safety", "pii")}, nil)
+
+	callouts := tenantCatalog(t, []client.Object{aitenant, mtc, team}, safety)
+	assertCatalog(t, flattenChecks(callouts), []placedCheck{
+		{"safety", "pii"}, {"safety", "jail"},
+	})
+}
+
+// TestBaselineOrderIgnoresAttachmentOrder pins that a narrower list cannot
+// reorder the baseline. The subscription asks for jail before pii, and for a
+// policy of its own. The baseline took both checks in policy order, so that
+// is the order they run in, and the subscription's own policy runs after
+// them.
+func TestBaselineOrderIgnoresAttachmentOrder(t *testing.T) {
+	endpoint := "http://nemo.infra.svc"
+	safety := policyWithChecks("safety", endpoint, "pii", "jail")
+	extra := policyWithChecks("extra", endpoint, "toxicity")
+	aitenant, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+	team := subscriptionWithGuardrails("team", []any{
+		attachEntry("safety", "jail", "pii"),
+		attachEntry("extra"),
+	}, nil)
+
+	callouts := tenantCatalog(t, []client.Object{aitenant, mtc, team}, safety, extra)
+	assertCatalog(t, flattenChecks(callouts), []placedCheck{
+		{"safety", "pii"}, {"safety", "jail"}, {"extra", "toxicity"},
+	})
+}
+
+// TestBaselineCheckIsNotReplacedByASameName pins that a tenant policy
+// declaring a check the baseline already runs adds a second check rather
+// than taking the baseline's place. A check is identified by its policy and
+// its name, so the baseline keeps its own configuration and runs first.
+func TestBaselineCheckIsNotReplacedByASameName(t *testing.T) {
+	endpoint := "http://nemo.infra.svc"
+	safety := policyWithChecks("safety", endpoint, "pii")
+	lax := policyWithChecks("lax", endpoint, "pii")
+	aitenant, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+	team := subscriptionWithGuardrails("team", []any{attachEntry("lax")}, nil)
+
+	callouts := tenantCatalog(t, []client.Object{aitenant, mtc, team}, safety, lax)
+	assertCatalog(t, flattenChecks(callouts), []placedCheck{
+		{"safety", "pii"}, {"lax", "pii"},
+	})
+	if got := callouts[0].checks[0].configID; got != "safety-pii" {
+		t.Fatalf("baseline check runs configuration %q, want safety-pii", got)
+	}
+}
+
+// TestBaselineDigestIgnoresAnOverrideAttempt compiles the same baseline with
+// and without attachments that re-select it, and pins that the post-auth
+// Deployment's config digest is unchanged. Dropping a check from the
+// baseline moves it, so the first comparison is reading a digest that does
+// track the catalog.
+func TestBaselineDigestIgnoresAnOverrideAttempt(t *testing.T) {
+	endpoint := "http://nemo.infra.svc"
+	safety := policyWithChecks("safety", endpoint, "pii", "jail")
+
+	aitenant, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+	alone := nemoConfigDigest(t, tenantCatalog(t, []client.Object{aitenant, mtc}, safety))
+
+	reselected, reselectedMTC := baselineTenant(
+		[]any{attachEntry("safety")},
+		[]any{attachEntry("safety", "pii")},
+	)
+	team := subscriptionWithGuardrails("team", []any{attachEntry("safety", "jail", "pii")}, nil)
+	attempted := nemoConfigDigest(t, tenantCatalog(t, []client.Object{reselected, reselectedMTC, team}, safety))
+	if attempted != alone {
+		t.Fatalf("attachments that only re-select baseline checks changed the digest\nbaseline alone = %s\nwith attachments = %s", alone, attempted)
+	}
+
+	narrowed, narrowedMTC := baselineTenant([]any{attachEntry("safety", "pii")}, nil)
+	dropped := nemoConfigDigest(t, tenantCatalog(t, []client.Object{narrowed, narrowedMTC}, safety))
+	if dropped == alone {
+		t.Fatalf("dropping jail from the baseline left the digest at %s", alone)
+	}
+}
+
+// TestUnreadableBaselineAttachesEveryPolicy pins the baseline's fail-closed
+// path. A config naming an owning AITenant this catalog cannot read has a
+// baseline it cannot see, and an unseen baseline must not compile the same
+// as an empty one. Every tenant policy runs instead, in policy name order.
+func TestUnreadableBaselineAttachesEveryPolicy(t *testing.T) {
+	endpoint := "http://nemo.infra.svc"
+	foreign, _ := baselineTenant([]any{attachEntry("safety")}, nil)
+	_ = unstructured.SetNestedField(foreign.Object, "other-tenant", "status", "tenantNamespace")
+
+	for _, tc := range []struct {
+		name  string
+		owner []client.Object
+	}{
+		{"owning AITenant is gone", nil},
+		{"owning AITenant binds another config", []client.Object{foreign}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, mtc := baselineTenant([]any{attachEntry("safety")}, nil)
+			builder := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).
+				WithObjects(append([]client.Object{mtc}, tc.owner...)...).
+				WithObjects(policyWithChecks("safety", endpoint, "pii"), policyWithChecks("other", endpoint, "toxicity"))
+			callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a", false)
+			if !errors.Is(err, errMalformedAttachment) {
+				t.Fatalf("acceptedNemoCallouts error = %v, want malformed attachment", err)
+			}
+			assertCatalog(t, flattenChecks(callouts), []placedCheck{
+				{"other", "toxicity"}, {"safety", "pii"},
+			})
+		})
+	}
+}
+
+// placedCheck is one compiled check, named by the policy it came from.
+type placedCheck struct{ policy, check string }
+
+// flattenChecks reads a catalog as the checks it runs, in order.
+func flattenChecks(callouts []nemoCallout) []placedCheck {
+	var placed []placedCheck
+	for _, callout := range callouts {
+		for _, check := range callout.checks {
+			placed = append(placed, placedCheck{callout.name, check.name})
+		}
+	}
+	return placed
+}
+
+func assertCatalog(t *testing.T, got, want []placedCheck) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("checks = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("check %d = %v, want %v\nfull = %v", i, got[i], want[i], got)
+		}
+	}
+}
+
+// baselineTenant builds the AITenant carrying the platform baseline and the
+// MaasTenantConfig it owns.
+func baselineTenant(baseline, config []any) (aitenant, mtc *unstructured.Unstructured) {
+	aitenant = &unstructured.Unstructured{Object: map[string]any{
+		"spec":   map[string]any{"guardrails": baseline},
+		"status": map[string]any{"tenantNamespace": "tenant-a"},
+	}}
+	aitenant.SetGroupVersionKind(AITenantGVK)
+	aitenant.SetName("red")
+	aitenant.SetNamespace("ai-tenants")
+
+	mtc = NewMaasTenantConfig()
+	mtc.SetName(MaasTenantConfigInstanceName)
+	mtc.SetNamespace("tenant-a")
+	mtc.SetAnnotations(map[string]string{
+		AnnotationAITenantName:      "red",
+		AnnotationAITenantNamespace: "ai-tenants",
+	})
+	if config != nil {
+		_ = unstructured.SetNestedSlice(mtc.Object, config, "spec", "guardrails")
+	}
+	return aitenant, mtc
+}
+
+// attachEntry is one entry in a guardrails list. No checks selects the whole
+// policy.
+func attachEntry(name string, checks ...string) map[string]any {
+	entry := map[string]any{"ref": map[string]any{"name": name}}
+	if len(checks) > 0 {
+		selected := make([]any, 0, len(checks))
+		for _, check := range checks {
+			selected = append(selected, check)
+		}
+		entry["checks"] = selected
+	}
+	return entry
+}
+
+// policyWithChecks is an accepted policy whose checks run on input, in the
+// order given. Each check names its own configuration, so a test can tell
+// two same-named checks apart.
+func policyWithChecks(name, endpoint string, checks ...string) *aigatewayv1alpha1.AIGuardrail {
+	policy := acceptedPolicy(name, 3, 3, endpoint)
+	policy.Spec.Checks = nil
+	for _, check := range checks {
+		policy.Spec.Checks = append(policy.Spec.Checks, aigatewayv1alpha1.AIGuardrailCheck{
+			Name:     check,
+			ConfigID: name + "-" + check,
+			Phases:   []aigatewayv1alpha1.GuardrailPhase{aigatewayv1alpha1.GuardrailPhaseInput},
+		})
+	}
+	return policy
+}
+
+func tenantCatalog(t *testing.T, objects []client.Object, policies ...*aigatewayv1alpha1.AIGuardrail) []nemoCallout {
+	t.Helper()
+	builder := fake.NewClientBuilder().WithScheme(mtcSchemeForTests()).WithObjects(objects...)
+	for _, policy := range policies {
+		builder = builder.WithObjects(policy)
+	}
+	callouts, err := acceptedNemoCallouts(context.Background(), builder.Build(), "tenant-a", false)
+	if err != nil {
+		t.Fatalf("acceptedNemoCallouts: %v", err)
+	}
+	return callouts
+}
+
+// nemoConfigDigest compiles the catalog into the post-auth config and
+// returns the digest the Deployment carries.
+func nemoConfigDigest(t *testing.T, callouts []nemoCallout) string {
+	t.Helper()
+	resources := nemoCalloutFixtures("red", "gw")
+	if err := configureNemoCallouts(resources, "red", "gw", callouts); err != nil {
+		t.Fatalf("configureNemoCallouts: %v", err)
+	}
+	deployment := findResource(resources, "Deployment", PayloadProcessingDeploymentName("red"), "gw")
+	digest, found, err := unstructured.NestedString(deployment.Object, "spec", "template", "metadata", "annotations", nemoCalloutConfigAnnotation)
+	if err != nil || !found {
+		t.Fatalf("read %s: found=%v err=%v", nemoCalloutConfigAnnotation, found, err)
+	}
+	return digest
 }
 
 func subscriptionWithGuardrails(name string, guardrails, modelRefs []any) *unstructured.Unstructured {
