@@ -411,9 +411,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		Message:            compat.Message,
 	})
 
-	// Provider readiness resolves the provider's published checks endpoint,
-	// never inferring one from the NeMo CR's status.phase or from its name
-	// (see evaluateNemoReady).
+	// Provider readiness derives the provider's checks endpoint in an AI
+	// Gateway infrastructure namespace, never inferring one from the NeMo CR's
+	// status.phase (see evaluateNemoReady).
 	readiness := evaluateNemoReady(nemo)
 	readyStatus := metav1.ConditionFalse
 	if readiness.Ready {

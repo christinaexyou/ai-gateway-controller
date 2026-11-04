@@ -128,11 +128,11 @@ func createReadyProvider(t *testing.T, c client.Client, provider *unstructured.U
 
 // publishWorkloadNamespace writes status.workloadNamespace, standing in for
 // TrustyAI. It is the only status field this controller reads for provider
-// readiness: the Service behind it is derived, not published. The provider's
-// own namespace is the case where TrustyAI names the Service for the custom
-// resource alone.
+// readiness: the Service behind it is derived, not published. The controller
+// accepts only an AI Gateway infrastructure namespace, so the workload runs in
+// infraNamespace, the namespace every fixture tenant publishes.
 func publishWorkloadNamespace(t *testing.T, c client.Client, provider *unstructured.Unstructured) {
 	t.Helper()
-	require.NoError(t, unstructured.SetNestedField(provider.Object, provider.GetNamespace(), "status", "workloadNamespace"))
+	require.NoError(t, unstructured.SetNestedField(provider.Object, infraNamespace, "status", "workloadNamespace"))
 	require.NoError(t, c.Status().Update(t.Context(), provider))
 }

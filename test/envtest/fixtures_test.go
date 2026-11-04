@@ -190,11 +190,11 @@ func awaitGuardrailEnforced(t *testing.T, c client.Client, namespace string) *un
 	subscription.SetNamespace(namespace)
 	require.NoError(t, c.Create(t.Context(), subscription))
 
-	// The provider the policy names. It sits in namespace on two counts: that
-	// is what the default allowedConsumers rule authorizes, and the tenant
-	// compiler calls NeMo only in the MaasTenantConfig's status.infraNamespace,
-	// which these fixtures set to namespace. The controller owns the binding,
-	// so a hand-written accepted status is replaced by its own verdict.
+	// The provider the policy names. It sits in namespace because that is what
+	// the default allowedConsumers rule authorizes, and its workload runs in
+	// infraNamespace, the MaasTenantConfig's status.infraNamespace, which is the
+	// only place the tenant compiler calls NeMo. The controller owns the
+	// binding, so a hand-written accepted status is replaced by its own verdict.
 	createReadyProvider(t, c, nemoProvider(namespace, "guardrails", "safety", []string{"base-rails"}))
 
 	policy := aiGuardrail("safety", namespace)

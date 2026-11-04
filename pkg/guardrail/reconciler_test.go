@@ -108,7 +108,7 @@ func newNemo(namespace, name string, namespacesPolicy map[string]any) *unstructu
 	// something other than readiness reaches the verdict it is written for.
 	// withoutNemoEndpoint takes it back off.
 	u.SetAnnotations(map[string]string{nemoAuthAnnotation: "true"})
-	if err := unstructured.SetNestedField(u.Object, namespace, "status", "workloadNamespace"); err != nil {
+	if err := unstructured.SetNestedField(u.Object, testInfraNS, "status", "workloadNamespace"); err != nil {
 		panic(err)
 	}
 	return withNemoConfigs(u, guardrailConfig)
@@ -636,7 +636,7 @@ func TestReconcileRepublishesTheBindingRevisionWhenDependenciesMove(t *testing.T
 			mutate: func(t *testing.T, f *fixture) {
 				t.Helper()
 				mutateLiveProvider(t, f, func(u *unstructured.Unstructured) {
-					if err := unstructured.SetNestedField(u.Object, "relocated", "status", "workloadNamespace"); err != nil {
+					if err := unstructured.SetNestedField(u.Object, "redhat-ai-gateway-infra", "status", "workloadNamespace"); err != nil {
 						t.Fatalf("set status.workloadNamespace: %v", err)
 					}
 				})
